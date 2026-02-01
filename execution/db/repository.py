@@ -81,12 +81,6 @@ def log_event(event_type, message):
     conn.close()
 
 def has_executed_signal(signal_id: str) -> bool:
-    """
-    True if we already executed this signal_id.
-    We consider a signal executed if there's an audit_log entry:
-      event_type = 'TRADE_EXECUTED_DEMO'
-      message contains 'id=<signal_id>'
-    """
     if not signal_id:
         return False
 
@@ -105,3 +99,37 @@ def has_executed_signal(signal_id: str) -> bool:
     row = cur.fetchone()
     conn.close()
     return row is not None
+
+# ---------------- INSPECT HELPERS ----------------
+
+def list_positions(limit: int = 20):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, symbol, side, size, entry_price, status, opened_at, closed_at, pnl
+        FROM positions
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (int(limit),)
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+def list_audit_log(limit: int = 30):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, event_type, message, created_at
+        FROM audit_log
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (int(limit),)
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
