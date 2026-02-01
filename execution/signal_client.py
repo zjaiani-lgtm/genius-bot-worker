@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+
 from execution.logger import log_info, log_warning
 from execution.db.repository import log_event, has_executed_signal
 
@@ -9,7 +10,14 @@ SIGNAL_FILE = Path("signal_outbox.json")
 
 
 def _validate(signal: dict) -> bool:
-    required = ["signal_id", "timestamp_utc", "final_verdict", "certified_signal", "confidence", "mode_allowed"]
+    required = [
+        "signal_id",
+        "timestamp_utc",
+        "final_verdict",
+        "certified_signal",
+        "confidence",
+        "mode_allowed",
+    ]
     for k in required:
         if k not in signal:
             log_warning(f"Signal missing field: {k}")
@@ -29,7 +37,10 @@ def _load_signal() -> dict | None:
 
 def _save_signal(signal: dict) -> None:
     # Pretty format for readability
-    SIGNAL_FILE.write_text(json.dumps(signal, indent=2, ensure_ascii=False), encoding="utf-8")
+    SIGNAL_FILE.write_text(
+        json.dumps(signal, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
 
 
 def acknowledge_processed(signal: dict, reason: str) -> None:
@@ -51,7 +62,7 @@ def get_latest_signal():
     """
     Returns:
       - dict signal if should be handled now
-      - None if no signal / invalid / already processed / already executed
+      - None if no signal / invalid / already processed / already executed / auto-acked
     """
 
     signal = _load_signal()
@@ -66,11 +77,16 @@ def get_latest_signal():
         return None
 
     signal_id = signal.get("signal_id")
-    verdict = signal.get("final_verdict")
+    verdict = (signal.get("final_verdict") or "").upper()
 
     # If already executed -> ACK and stop spam
     if has_executed_signal(signal_id):
         acknowledge_processed(signal, "already_executed")
+        return None
+
+    # Auto-ACK anything that's not TRADE/CLOSE (keeps pipeline clean)
+    if verdict not in ("TRADE", "CLOSE"):
+        acknowledge_processed(signal, f"verdict_{verdict}")
         return None
 
     # Log that we saw it (once, before handling)
