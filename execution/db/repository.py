@@ -60,7 +60,7 @@ def open_position(symbol, side, size, entry_price):
         (symbol, side, size, entry_price, status, opened_at)
         VALUES (?, ?, ?, ?, 'OPEN', ?)
         """,
-        (symbol, side, size, entry_price, datetime.utcnow().isoformat())
+        (symbol, side, float(size), float(entry_price), datetime.utcnow().isoformat())
     )
     conn.commit()
     conn.close()
@@ -80,3 +80,28 @@ def log_event(event_type, message):
     conn.commit()
     conn.close()
 
+def has_executed_signal(signal_id: str) -> bool:
+    """
+    True if we already executed this signal_id.
+    We consider a signal executed if there's an audit_log entry:
+      event_type = 'TRADE_EXECUTED_DEMO'
+      message contains 'id=<signal_id>'
+    """
+    if not signal_id:
+        return False
+
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT 1
+        FROM audit_log
+        WHERE event_type = 'TRADE_EXECUTED_DEMO'
+          AND message LIKE ?
+        LIMIT 1
+        """,
+        (f"%id={signal_id}%",)
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row is not None
