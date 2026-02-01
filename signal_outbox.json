@@ -1,6 +1,6 @@
 {
-  "signal_id": "GBM-TEST-CLOSE-001",
-  "timestamp_utc": "2026-02-01T19:10:00Z",
+  "signal_id": "GBM-TEST-CLOSE-002",
+  "timestamp_utc": "2026-02-01T19:20:00Z",
   "final_verdict": "CLOSE",
   "certified_signal": true,
   "confidence": 0.9,
