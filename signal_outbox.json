@@ -1,21 +1,15 @@
 {
-  "signal_id": "GBM-TEST-TRADE-002",
-  "timestamp_utc": "2026-02-01T19:27:00Z",
-  "final_verdict": "TRADE",
+  "signal_id": "GBM-TEST-CLOSE-005",
+  "timestamp_utc": "2026-02-01T19:50:00Z",
+  "final_verdict": "CLOSE",
   "certified_signal": true,
-  "confidence": 0.81,
+  "confidence": 0.9,
   "mode_allowed": { "demo": true, "live": false },
   "block_reason": null,
   "execution": {
     "symbol": "BTC/USDT",
-    "direction": "LONG",
-    "entry": { "type": "MARKET", "price": 43000 },
-    "position_size": 0.01,
-    "risk": { "stop_loss": 42000, "take_profit": 44000 }
+    "close": { "type": "MARKET", "price": 43500 }
   },
   "limits": null,
-  "meta": {
-    "source": "manual_test",
-    "note": "open demo position"
-  }
+  "meta": { "source": "manual_test", "note": "close after confirmed open" }
 }
