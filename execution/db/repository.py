@@ -51,6 +51,23 @@ def get_open_positions():
     conn.close()
     return rows
 
+def get_latest_open_position(symbol: str):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, symbol, side, size, entry_price, status, opened_at, closed_at, pnl
+        FROM positions
+        WHERE status = 'OPEN' AND symbol = ?
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (symbol,)
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row
+
 def open_position(symbol, side, size, entry_price):
     conn = get_connection()
     cur = conn.cursor()
@@ -61,6 +78,20 @@ def open_position(symbol, side, size, entry_price):
         VALUES (?, ?, ?, ?, 'OPEN', ?)
         """,
         (symbol, side, float(size), float(entry_price), datetime.utcnow().isoformat())
+    )
+    conn.commit()
+    conn.close()
+
+def close_position(position_id: int, close_price: float, pnl: float):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE positions
+        SET status='CLOSED', closed_at=?, pnl=?
+        WHERE id=?
+        """,
+        (datetime.utcnow().isoformat(), float(pnl), int(position_id))
     )
     conn.commit()
     conn.close()
@@ -90,7 +121,7 @@ def has_executed_signal(signal_id: str) -> bool:
         """
         SELECT 1
         FROM audit_log
-        WHERE event_type = 'TRADE_EXECUTED_DEMO'
+        WHERE event_type IN ('TRADE_EXECUTED_DEMO','POSITION_CLOSED_DEMO')
           AND message LIKE ?
         LIMIT 1
         """,
