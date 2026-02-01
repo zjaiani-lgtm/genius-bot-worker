@@ -10,6 +10,7 @@ from execution.db.repository import (
     has_executed_signal,
 )
 from execution.virtual_wallet import simulate_market_entry, simulate_market_close
+from execution.signal_client import acknowledge_processed
 
 
 def _calc_pnl(side: str, entry_price: float, close_price: float, size: float) -> float:
@@ -114,10 +115,12 @@ def execute_signal(signal: dict) -> None:
             return
 
         pos = get_latest_open_position(symbol)
-        if not pos:
+                if not pos:
             log_warning(f"Engine: no OPEN position for {symbol} -> NO CLOSE | id={signal_id}")
             log_event("CLOSE_BLOCKED", f"id={signal_id} reason=NO_OPEN_POSITION symbol={symbol}")
+            acknowledge_processed(signal, "close_blocked_no_open_position")
             return
+
 
         # pos: (id, symbol, side, size, entry_price, status, opened_at, closed_at, pnl)
         position_id = pos[0]
