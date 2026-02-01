@@ -1,3 +1,4 @@
+print("LOGGER MODULE LOADED", flush=True)
 # execution/logger.py
 from datetime import datetime
 
