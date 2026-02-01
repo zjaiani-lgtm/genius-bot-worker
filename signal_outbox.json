@@ -1,12 +1,15 @@
 {
-  "signal_id": "GBM-TEST-NO-001",
-  "timestamp_utc": "2026-02-01T17:30:00Z",
-  "final_verdict": "NO_TRADE",
-  "certified_signal": false,
-  "confidence": 0.0,
+  "signal_id": "GBM-TEST-TRADE-001",
+  "timestamp_utc": "2026-02-01T17:40:00Z",
+  "final_verdict": "TRADE",
+  "certified_signal": true,
+  "confidence": 0.81,
   "mode_allowed": { "demo": true, "live": false },
-  "block_reason": "TEST_NO_TRADE",
-  "execution": null,
-  "limits": null,
-  "meta": null
+  "execution": {
+    "symbol": "BTC/USDT",
+    "direction": "LONG",
+    "entry": { "type": "MARKET", "price": 43000 },
+    "position_size": 0.01,
+    "risk": { "stop_loss": 42000, "take_profit": 44000 }
+  }
 }
