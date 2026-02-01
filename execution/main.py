@@ -6,7 +6,7 @@ from execution.logger import log_info, log_warning
 from execution.config import MODE
 from execution.db.db import init_db
 from execution.signal_client import get_latest_signal
-
+from execution.execution_engine import execute_signal
 
 POLL_INTERVAL_SECONDS = 10
 
@@ -25,7 +25,6 @@ def main():
             signal = get_latest_signal()
 
             if signal is None:
-                # no signal found or invalid
                 log_info("Worker alive, waiting for SIGNAL_OUTBOX...")
             else:
                 signal_id = signal.get("signal_id")
@@ -33,18 +32,11 @@ def main():
 
                 log_info(f"Signal received | id={signal_id} | verdict={verdict}")
 
-                # IMPORTANT:
-                # Execution logic is NOT wired yet
-                # We only observe & log signals at this phase
-                if verdict != "TRADE":
-                    log_info(f"NO_TRADE respected | id={signal_id}")
-                else:
-                    log_warning(
-                        f"TRADE signal detected but execution is DISABLED (SAFE MODE) | id={signal_id}"
-                    )
+                # Phase 3: DEMO execution engine (safe)
+                execute_signal(signal)
 
         except Exception as e:
-            # Any unexpected error must NEVER crash the worker
+            # Worker must never crash; any error -> log and continue
             log_warning(f"Worker loop error: {e}")
 
         time.sleep(POLL_INTERVAL_SECONDS)
