@@ -1,18 +1,19 @@
+# execution/db/db.py
+
 import sqlite3
 from pathlib import Path
-
-DB_PATH = Path("/var/data/genius_bot.db")
-
+from execution.config import DB_PATH
 
 def get_connection():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    return sqlite3.connect(DB_PATH)
-
+    # check_same_thread=False safe for single-process worker (Render)
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
 
 def init_db():
     conn = get_connection()
     cur = conn.cursor()
 
+    # positions
     cur.execute("""
     CREATE TABLE IF NOT EXISTS positions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -27,6 +28,7 @@ def init_db():
     )
     """)
 
+    # audit log
     cur.execute("""
     CREATE TABLE IF NOT EXISTS audit_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -34,6 +36,23 @@ def init_db():
         message TEXT NOT NULL,
         created_at TEXT NOT NULL
     )
+    """)
+
+    # system state (for gates)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS system_state (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        status TEXT NOT NULL DEFAULT 'RUNNING',
+        startup_sync_ok INTEGER NOT NULL DEFAULT 0,
+        kill_switch INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL
+    )
+    """)
+
+    # ensure row exists
+    cur.execute("""
+    INSERT OR IGNORE INTO system_state (id, status, startup_sync_ok, kill_switch, updated_at)
+    VALUES (1, 'RUNNING', 0, 0, datetime('now'))
     """)
 
     conn.commit()
