@@ -48,3 +48,9 @@ CREATE TABLE IF NOT EXISTS audit_log (
     created_at TEXT NOT NULL
 );
 
+-- Optional: speed up lookups
+CREATE INDEX IF NOT EXISTS ix_audit_event_type ON audit_log(event_type);
+CREATE INDEX IF NOT EXISTS ix_positions_status ON positions(status);
+
+-- Idempotency support (soft): ensure we can prevent duplicates by querying quickly
+-- (We use has_executed_signal() in repository; unique constraint not required for v1.)
