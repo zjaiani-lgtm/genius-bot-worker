@@ -4,7 +4,8 @@ import sqlite3
 from pathlib import Path
 from datetime import datetime
 
-DB_PATH = Path("data/genius_bot.db")
+DB_PATH = Path("data/genius_bot_v2.db")
+
 
 def get_connection():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
