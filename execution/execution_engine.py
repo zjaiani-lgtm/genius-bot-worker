@@ -1,95 +1,100 @@
-# execution/execution_engine.py
+# execution/main.py
+import json
 import os
+import time
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List
+
+from execution.execution_engine import ExecutionEngine
 
 logger = logging.getLogger("gbm")
+logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(asctime)s - %(message)s")
 
 
-class ExecutionEngine:
-    def __init__(self):
-        self.mode = os.getenv("MODE", "DEMO").upper()  # DEMO | TESTNET | LIVE
-        self.kill_switch = os.getenv("KILL_SWITCH", "false").lower() == "true"
-        self.live_confirmation = os.getenv("LIVE_CONFIRMATION", "false").lower() == "true"
+SIGNAL_OUTBOX_PATH = os.getenv("SIGNAL_OUTBOX_PATH", "/var/data/signal_outbox.json")
+POLL_SECONDS = int(os.getenv("SIGNAL_POLL_SECONDS", "10"))
 
-        # TODO: if you have DB/client, wire them here
-        # from execution.exchange_client import BinanceSpotClient
-        # self.exchange = BinanceSpotClient()
 
-    def startup_sync(self) -> None:
-        # placeholder: you already have a working startup_sync and audit logs
-        logger.info("STARTUP_SYNC: OK")
+def ensure_outbox_exists(path: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if not os.path.exists(path):
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"signals": []}, f, indent=2)
+        logger.info(f"SIGNAL_OUTBOX created | path={path}")
+    else:
+        logger.info(f"SIGNAL_OUTBOX ready | path={path}")
 
-    def execute_signal(self, signal: Dict[str, Any]) -> None:
-        # ✅ LOG #2 — confirms we entered execute_signal
-        logger.info(
-            f"EXEC_ENTER | id={signal.get('signal_id')} "
-            f"verdict={signal.get('final_verdict')} "
-            f"KILL_SWITCH={self.kill_switch} MODE={self.mode}"
-        )
 
-        verdict = str(signal.get("final_verdict", "")).upper()
+def read_outbox(path: str) -> List[Dict[str, Any]]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        signals = data.get("signals", [])
+        if not isinstance(signals, list):
+            logger.warning("SIGNAL_OUTBOX invalid format: 'signals' is not a list")
+            return []
+        return signals
+    except json.JSONDecodeError as e:
+        logger.error(f"SIGNAL_OUTBOX JSON decode error: {e}")
+        return []
+    except FileNotFoundError:
+        logger.error("SIGNAL_OUTBOX missing (FileNotFoundError)")
+        return []
+    except Exception as e:
+        logger.exception(f"SIGNAL_OUTBOX read failed: {e}")
+        return []
 
-        # safety: only TRADE/CLOSE supported in this reference
-        if verdict not in ("TRADE", "CLOSE", "NO_TRADE"):
-            logger.warning(f"EXEC_REJECT | unknown verdict={verdict} | id={signal.get('signal_id')}")
-            return
 
-        if verdict == "NO_TRADE":
-            logger.info(f"EXEC_NO_TRADE | id={signal.get('signal_id')}")
-            return
+def acknowledge_processed(path: str) -> None:
+    # clear outbox so it won't repeat
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"signals": []}, f, indent=2)
+    except Exception as e:
+        logger.exception(f"ACK failed (could not clear outbox): {e}")
 
-        # ✅ LOG #3 — kill-switch gate
-        if self.kill_switch:
-            logger.warning(f"EXEC_BLOCKED | KILL_SWITCH=ON | id={signal.get('signal_id')}")
-            return
 
-        # extra LIVE gate
-        if self.mode == "LIVE" and not self.live_confirmation:
-            logger.warning(f"EXEC_BLOCKED | LIVE_CONFIRMATION=OFF | id={signal.get('signal_id')}")
-            return
+def run_worker() -> None:
+    mode = os.getenv("MODE", "DEMO").upper()
+    kill_switch = os.getenv("KILL_SWITCH", "false").lower() == "true"
+    live_confirmation = os.getenv("LIVE_CONFIRMATION", "false").lower() == "true"
 
-        # parse execution payload
-        execution = signal.get("execution") or {}
-        symbol = execution.get("symbol")
-        direction = str(execution.get("direction", "")).upper()
-        entry = execution.get("entry") or {}
-        entry_type = str(entry.get("type", "")).upper()
+    logger.info(f"GENIUS BOT MAN worker starting | MODE={mode}")
+    logger.info(f"KILL_SWITCH={'ON' if kill_switch else 'OFF'} | LIVE_CONFIRMATION={'ON' if live_confirmation else 'OFF'}")
 
-        quote_amount = execution.get("quote_amount")  # e.g. 5 USDT
-        position_size = execution.get("position_size")  # e.g. 0.0001 BTC (alternative)
+    ensure_outbox_exists(SIGNAL_OUTBOX_PATH)
 
-        # validation
-        if not symbol or direction not in ("LONG", "SHORT"):
-            logger.warning(f"EXEC_REJECT | missing/invalid symbol/direction | id={signal.get('signal_id')} symbol={symbol} dir={direction}")
-            return
+    engine = ExecutionEngine()
 
-        if entry_type not in ("MARKET",):
-            logger.warning(f"EXEC_REJECT | unsupported entry.type={entry_type} | id={signal.get('signal_id')}")
-            return
+    # optional: startup sync placeholder (you already have this in your project)
+    engine.startup_sync()
 
-        if quote_amount is None and position_size is None:
-            logger.warning(f"EXEC_REJECT | missing quote_amount or position_size | id={signal.get('signal_id')}")
-            return
+    while True:
+        signals = read_outbox(SIGNAL_OUTBOX_PATH)
 
-        # decide side
-        side = "buy" if direction == "LONG" else "sell"
+        if not signals:
+            logger.info("Worker alive, waiting for SIGNAL_OUTBOX...")
+            time.sleep(POLL_SECONDS)
+            continue
 
-        logger.info(
-            f"EXEC_PARSED | id={signal.get('signal_id')} symbol={symbol} side={side} "
-            f"quote_amount={quote_amount} position_size={position_size} entry={entry_type}"
-        )
+        # process all signals found
+        for signal in signals:
+            signal_id = str(signal.get("signal_id", "UNKNOWN"))
+            verdict = str(signal.get("final_verdict", "UNKNOWN"))
 
-        # --- PLACEHOLDER for real execution ---
-        # Here you call BinanceSpotClient / ccxt create_order
-        #
-        # if quote_amount is not None:
-        #     # Option A: createOrder with quoteOrderQty (Binance specific)
-        #     # or compute amount using ticker price then round to precision.
-        #     pass
-        # else:
-        #     # Option B: create market order with amount (base asset)
-        #     pass
-        #
-        # For now, log only:
-        logger.info(f"EXEC_DRYRUN | would execute {entry_type} {side} on {symbol} | id={signal.get('signal_id')}")
+            logger.info(f"Signal received | id={signal_id} | verdict={verdict}")
+
+            # ✅ LOG #1 — confirms we call execute_signal
+            logger.info(f"AFTER_RECEIVE | calling execute_signal | id={signal_id}")
+
+            try:
+                engine.execute_signal(signal)
+            except Exception as e:
+                logger.exception(f"EXECUTION ERROR | id={signal_id} err={e}")
+
+        # ACK/clear after processing batch
+        acknowledge_processed(SIGNAL_OUTBOX_PATH)
+
+
+if __name__ == "__main__":
+    run_worker()
