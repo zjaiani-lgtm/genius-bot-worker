@@ -1,13 +1,12 @@
 # execution/db/db.py
-
 import sqlite3
-from pathlib import Path
 from execution.config import DB_PATH
 
 def get_connection():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    # check_same_thread=False safe for single-process worker (Render)
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row  # ✅ critical: dict-like rows
+    return conn
 
 def init_db():
     conn = get_connection()
