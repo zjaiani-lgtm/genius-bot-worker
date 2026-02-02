@@ -15,21 +15,6 @@ from execution.exchange_client import BinanceSpotClient
 
 
 def run_startup_sync() -> bool:
-    """
-    Startup Sync responsibilities:
-
-    - Always:
-        - Respect kill-switch gate (ENV/DB)
-    - DEMO:
-        - OK (positions handled virtually)
-        - Marks system ACTIVE + startup_sync_ok=True
-    - TESTNET / LIVE:
-        - 1) Public connectivity check
-        - 2) Private connectivity check (keys)
-        - If DB has OPEN positions -> PAUSE (until reconcile is implemented)
-        - If DB has no open positions -> ACTIVE
-    """
-
     mode = (MODE or "DEMO").upper()
 
     # --- 0) Kill switch gate (ENV OR DB) ---
@@ -54,15 +39,9 @@ def run_startup_sync() -> bool:
 
     # --- 2) DEMO: always OK ---
     if mode == "DEMO":
-        if open_count == 0:
-            log_info("STARTUP_SYNC: DEMO -> no open positions in DB -> OK")
-            update_system_state(startup_sync_ok=True, status="ACTIVE")
-            log_event("STARTUP_SYNC_OK", "demo_no_open_positions")
-            return True
-
-        log_info(f"STARTUP_SYNC: DEMO -> assume OK | db_open_positions={open_count}")
+        log_info(f"STARTUP_SYNC: DEMO -> db_open_positions={open_count} -> OK")
         update_system_state(startup_sync_ok=True, status="ACTIVE")
-        log_event("STARTUP_SYNC_OK", f"demo_assumed_ok count={open_count}")
+        log_event("STARTUP_SYNC_OK", f"demo count={open_count}")
         return True
 
     # --- 3) TESTNET / LIVE: connectivity checks ---
@@ -91,22 +70,7 @@ def run_startup_sync() -> bool:
 
     # --- 4) Safety rule: if DB says OPEN positions exist, reconcile required ---
     if open_count > 0:
-        preview = []
-        try:
-            for p in open_positions[:3]:
-                if isinstance(p, dict):
-                    preview.append(f"{p.get('symbol')} {p.get('side')} size={p.get('size')}")
-                else:
-                    preview.append(str(p))
-        except Exception:
-            pass
-
-        preview_txt = " | ".join(preview) if preview else "n/a"
-
-        log_warning(
-            f"STARTUP_SYNC: {mode} -> DB has OPEN positions ({open_count}) "
-            f"but reconcile not implemented -> PAUSE | preview={preview_txt}"
-        )
+        log_warning(f"STARTUP_SYNC: {mode} -> DB has OPEN positions ({open_count}) -> PAUSE")
         update_system_state(startup_sync_ok=False, status="PAUSED")
         log_event("STARTUP_SYNC_FAIL", f"open_positions_require_reconcile count={open_count}")
         return False
