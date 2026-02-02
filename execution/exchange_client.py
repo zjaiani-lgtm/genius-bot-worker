@@ -1,105 +1,100 @@
-# exchange_client.py
+# execution/exchange_client.py
 
 import os
-import ccxt
 import time
+import uuid
+from typing import Any, Dict, Optional
+
+import ccxt
 
 
-class ExchangeClient:
+class ExchangeClientError(Exception):
+    pass
+
+
+class LiveTradingBlocked(Exception):
+    pass
+
+
+class BinanceSpotClient:
+    """
+    Binance Spot client supporting TESTNET by overriding REST base URL.
+    Modes:
+      - DEMO: should not be used here (worker uses virtual_wallet)
+      - TESTNET: connects to Spot testnet
+      - LIVE: connects to real Binance spot (NOT recommended until ready)
+
+    Safety gates:
+      - KILL_SWITCH
+      - LIVE_CONFIRMATION
+    """
+
+    TESTNET_REST_BASE = "https://testnet.binance.vision/api"
+
     def __init__(self):
-        self.mode = os.getenv("MODE", "DEMO")          # DEMO | TESTNET | LIVE
-        self.kill_switch = os.getenv("KILL_SWITCH", "true").lower() == "true"
+        self.mode = os.getenv("MODE", "DEMO").upper()  # DEMO | TESTNET | LIVE
+        self.kill_switch = os.getenv("KILL_SWITCH", "false").lower() == "true"
         self.live_confirmation = os.getenv("LIVE_CONFIRMATION", "false").lower() == "true"
 
-        self.api_key = os.getenv("BINANCE_API_KEY")
-        self.api_secret = os.getenv("BINANCE_API_SECRET")
-
-        self.exchange = None
+        api_key = os.getenv("BINANCE_API_KEY", "").strip()
+        api_secret = os.getenv("BINANCE_API_SECRET", "").strip()
 
         if self.mode in ("TESTNET", "LIVE"):
-            self._init_binance()
-
-    # -----------------------------
-    # INIT BINANCE (SPOT)
-    # -----------------------------
-    def _init_binance(self):
-        if not self.api_key or not self.api_secret:
-            raise RuntimeError("❌ BINANCE_API_KEY / BINANCE_API_SECRET not set")
+            if not api_key or not api_secret:
+                raise ExchangeClientError("Missing BINANCE_API_KEY / BINANCE_API_SECRET for TESTNET/LIVE")
 
         self.exchange = ccxt.binance({
-            "apiKey": self.api_key,
-            "secret": self.api_secret,
+            "apiKey": api_key,
+            "secret": api_secret,
             "enableRateLimit": True,
+            "options": {"defaultType": "spot"},
         })
 
-        # Spot only
-        self.exchange.options["defaultType"] = "spot"
-
-        # TESTNET endpoint
         if self.mode == "TESTNET":
-            self.exchange.urls["api"] = {
-                "public": "https://testnet.binance.vision/api",
-                "private": "https://testnet.binance.vision/api",
-            }
+            self._apply_testnet_urls()
 
-        # Safety check
-        self.exchange.check_required_credentials()
+        # Validate connectivity (and load precision/markets)
+        self.exchange.load_markets()
 
-    # -----------------------------
-    # BASIC READ METHODS
-    # -----------------------------
-    def fetch_balance(self):
-        if not self.exchange:
-            raise RuntimeError("Exchange not initialized")
+    def _apply_testnet_urls(self):
+        # Force REST base to official Spot Testnet endpoint
+        self.exchange.urls["api"] = {
+            "public": self.TESTNET_REST_BASE,
+            "private": self.TESTNET_REST_BASE,
+        }
+
+    def _require_trade_allowed(self):
+        # Even on TESTNET we keep gates to avoid accidental trading.
+        if self.kill_switch:
+            raise LiveTradingBlocked("KILL_SWITCH=true -> trading blocked")
+        if not self.live_confirmation:
+            raise LiveTradingBlocked("LIVE_CONFIRMATION=false -> trading blocked")
+
+    # --------- read ----------
+    def fetch_balance(self) -> Dict[str, Any]:
         return self.exchange.fetch_balance()
 
-    def fetch_open_orders(self, symbol=None):
-        return self.exchange.fetch_open_orders(symbol)
-
-    # -----------------------------
-    # ORDER EXECUTION
-    # -----------------------------
-    def create_market_order(self, symbol, side, amount, client_order_id=None):
+    # --------- trade ----------
+    def create_market_buy_by_quote(self, symbol: str, quote_amount: float, client_order_id: Optional[str] = None) -> Dict[str, Any]:
         """
-        side: BUY or SELL
-        amount: base asset amount (e.g. BTC amount)
+        Spend quote currency amount (e.g. 10 USDT) to buy base (BTC).
+        Uses Binance param: quoteOrderQty.
         """
+        self._require_trade_allowed()
+        cid = client_order_id or self._new_client_order_id("buy")
+        params = {"newClientOrderId": cid, "quoteOrderQty": float(quote_amount)}
+        return self.exchange.create_order(symbol, "market", "buy", 0, None, params)
 
-        if self.kill_switch:
-            raise RuntimeError("🛑 KILL_SWITCH is ON — execution blocked")
-
-        if self.mode == "LIVE" and not self.live_confirmation:
-            raise RuntimeError("⚠️ LIVE_CONFIRMATION=false — LIVE execution blocked")
-
-        if not self.exchange:
-            raise RuntimeError("Exchange not initialized")
-
-        params = {}
-
-        if client_order_id:
-            params["newClientOrderId"] = client_order_id
-
-        order = self.exchange.create_order(
-            symbol=symbol,
-            type="market",
-            side=side.lower(),
-            amount=amount,
-            params=params,
-        )
-
-        return order
-
-    # -----------------------------
-    # CLOSE POSITION (SPOT)
-    # -----------------------------
-    def close_spot_position(self, symbol, amount, client_order_id=None):
+    def create_market_sell(self, symbol: str, base_amount: float, client_order_id: Optional[str] = None) -> Dict[str, Any]:
         """
-        Spot CLOSE = SELL base asset
+        Sell base amount (e.g. 0.0002 BTC) back to quote (USDT).
         """
-        return self.create_market_order(
-            symbol=symbol,
-            side="SELL",
-            amount=amount,
-            client_order_id=client_order_id,
-        )
+        self._require_trade_allowed()
+        cid = client_order_id or self._new_client_order_id("sell")
+        params = {"newClientOrderId": cid}
+        return self.exchange.create_order(symbol, "market", "sell", float(base_amount), None, params)
 
+    # --------- helpers ----------
+    @staticmethod
+    def _new_client_order_id(side: str) -> str:
+        return f"gbm_{side}_{int(time.time())}_{uuid.uuid4().hex[:10]}"
