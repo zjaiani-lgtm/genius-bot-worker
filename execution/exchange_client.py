@@ -19,14 +19,8 @@ class LiveTradingBlocked(Exception):
 class BinanceSpotClient:
     """
     Binance Spot client supporting TESTNET by overriding REST base URL.
-    Modes:
-      - DEMO: should not be used here (worker uses virtual_wallet)
-      - TESTNET: connects to Spot testnet
-      - LIVE: connects to real Binance spot (NOT recommended until ready)
-
-    Safety gates:
-      - KILL_SWITCH
-      - LIVE_CONFIRMATION
+    Key point for TESTNET:
+      - Disable fetchCurrencies (it calls SAPI capital/config endpoints and fails on testnet).
     """
 
     TESTNET_REST_BASE = "https://testnet.binance.vision/api"
@@ -47,13 +41,18 @@ class BinanceSpotClient:
             "apiKey": api_key,
             "secret": api_secret,
             "enableRateLimit": True,
-            "options": {"defaultType": "spot"},
+            "options": {
+                "defaultType": "spot",
+                # ✅ CRITICAL: prevent SAPI calls (capital/config/...) triggered by load_markets()
+                # Testnet doesn't support ccxt's sandbox SAPI flow -> crashes otherwise.
+                "fetchCurrencies": False,
+            },
         })
 
         if self.mode == "TESTNET":
             self._apply_testnet_urls()
 
-        # Validate connectivity (and load precision/markets)
+        # ✅ load_markets AFTER setting fetchCurrencies False + urls
         self.exchange.load_markets()
 
     def _apply_testnet_urls(self):
