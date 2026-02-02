@@ -1,96 +1,88 @@
 # execution/signal_client.py
 
+from __future__ import annotations
+
 import json
+import os
+import tempfile
 from pathlib import Path
-
-from execution.logger import log_info, log_warning
-from execution.db.repository import log_event, has_executed_signal
-
-SIGNAL_FILE = Path("signal_outbox.json")
+from typing import Any, Dict, List, Optional
 
 
-def _validate(signal: dict) -> bool:
-    required = [
-        "signal_id",
-        "timestamp_utc",
-        "final_verdict",
-        "certified_signal",
-        "confidence",
-        "mode_allowed",
-    ]
-    for k in required:
-        if k not in signal:
-            log_warning(f"Signal missing field: {k}")
-            return False
-    return True
+DEFAULT_OUTBOX_PATH = os.getenv("SIGNAL_OUTBOX_PATH", "/var/data/signal_outbox.json")
 
 
-def _load_signal() -> dict | None:
-    if not SIGNAL_FILE.exists():
-        return None
+class SignalClientError(Exception):
+    pass
+
+
+def ensure_signal_outbox_exists(path: str = DEFAULT_OUTBOX_PATH) -> Path:
+    p = Path(path)
+
+    # ensure parent dir exists (Render persistent disk mounted at /var/data)
+    p.parent.mkdir(parents=True, exist_ok=True)
+
+    if not p.exists():
+        _atomic_write_json(p, {"signals": []})
+
+    # if exists but empty/corrupt, heal it (optional but very helpful)
     try:
-        return json.loads(SIGNAL_FILE.read_text(encoding="utf-8"))
-    except Exception as e:
-        log_warning(f"Signal JSON read error: {e}")
-        return None
+        data = json.loads(p.read_text(encoding="utf-8") or "")
+        if not isinstance(data, dict) or "signals" not in data or not isinstance(data["signals"], list):
+            raise ValueError("invalid schema")
+    except Exception:
+        _atomic_write_json(p, {"signals": []})
+
+    return p
 
 
-def _save_signal(signal: dict) -> None:
-    # Pretty format for readability
-    SIGNAL_FILE.write_text(
-        json.dumps(signal, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
-
-
-def acknowledge_processed(signal: dict, reason: str) -> None:
-    """
-    Marks current signal file as processed so worker stops re-reading it forever.
-    Safe even if called multiple times.
-    """
+def read_outbox(path: str = DEFAULT_OUTBOX_PATH) -> Dict[str, Any]:
+    p = ensure_signal_outbox_exists(path)
     try:
-        signal["processed"] = True
-        signal["processed_reason"] = reason
-        _save_signal(signal)
-        log_info(f"SIGNAL_ACK: processed=true | reason={reason}")
-        log_event("SIGNAL_ACK", f"id={signal.get('signal_id')} reason={reason}")
+        return json.loads(p.read_text(encoding="utf-8"))
     except Exception as e:
-        log_warning(f"Signal ACK write failed: {e}")
+        raise SignalClientError(f"Failed to read outbox JSON | path={p} | err={e}") from e
 
 
-def get_latest_signal():
+def pop_next_signal(path: str = DEFAULT_OUTBOX_PATH) -> Optional[Dict[str, Any]]:
     """
-    Returns:
-      - dict signal if should be handled now
-      - None if no signal / invalid / already processed / already executed / auto-acked
+    Pop first signal from the queue (FIFO) and persist updated file atomically.
     """
+    p = ensure_signal_outbox_exists(path)
+    data = read_outbox(str(p))
+    signals: List[Dict[str, Any]] = data.get("signals", [])
 
-    signal = _load_signal()
-    if signal is None:
+    if not signals:
         return None
 
-    if not isinstance(signal, dict) or not _validate(signal):
-        return None
+    sig = signals.pop(0)
+    _atomic_write_json(p, {"signals": signals})
+    return sig
 
-    # If already marked processed in file -> ignore quietly
-    if signal.get("processed") is True:
-        return None
 
-    signal_id = signal.get("signal_id")
-    verdict = (signal.get("final_verdict") or "").upper()
+def append_signal(signal: Dict[str, Any], path: str = DEFAULT_OUTBOX_PATH) -> None:
+    p = ensure_signal_outbox_exists(path)
+    data = read_outbox(str(p))
+    signals: List[Dict[str, Any]] = data.get("signals", [])
+    signals.append(signal)
+    _atomic_write_json(p, {"signals": signals})
 
-    # If already executed -> ACK and stop spam
-    if has_executed_signal(signal_id):
-        acknowledge_processed(signal, "already_executed")
-        return None
 
-    # Auto-ACK anything that's not TRADE/CLOSE (keeps pipeline clean)
-    if verdict not in ("TRADE", "CLOSE"):
-        acknowledge_processed(signal, f"verdict_{verdict}")
-        return None
-
-    # Log that we saw it (once, before handling)
-    log_event("SIGNAL_SEEN", f"signal_id={signal_id} verdict={verdict}")
-    log_info(f"SIGNAL_SEEN: {signal_id} | verdict={verdict}")
-
-    return signal
+def _atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
+    """
+    Atomic write: write to temp file then replace -> no half-written JSON.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_fd, tmp_name = tempfile.mkstemp(prefix="outbox_", suffix=".json", dir=str(path.parent))
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_name, path)
+    finally:
+        try:
+            if os.path.exists(tmp_name):
+                os.remove(tmp_name)
+        except Exception:
+            pass
