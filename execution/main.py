@@ -4,13 +4,25 @@ import time
 import logging
 
 from execution.execution_engine import ExecutionEngine
-from execution.signal_client import ensure_signal_outbox_exists, pop_next_signal
-
+from execution.signal_client import (
+    ensure_signal_outbox_exists,
+    pop_next_signal,
+)
+from execution.signal_generator import run_once   # 👈 აი ეს import
 logger = logging.getLogger("gbm")
-logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(asctime)s - %(message)s")
 
-SIGNAL_OUTBOX_PATH = os.getenv("SIGNAL_OUTBOX_PATH", "/var/data/signal_outbox.json")
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(levelname)s] %(asctime)s - %(message)s"
+)
+
+SIGNAL_OUTBOX_PATH = os.getenv(
+    "SIGNAL_OUTBOX_PATH",
+    "/var/data/signal_outbox.json"
+)
+
 POLL_SECONDS = int(os.getenv("SIGNAL_POLL_SECONDS", "10"))
+
 
 def run_worker() -> None:
     mode = os.getenv("MODE", "DEMO").upper()
@@ -18,15 +30,27 @@ def run_worker() -> None:
     live_confirmation = os.getenv("LIVE_CONFIRMATION", "false").lower() == "true"
 
     logger.info(f"GENIUS BOT MAN worker starting | MODE={mode}")
-    logger.info(f"KILL_SWITCH={'ON' if kill_switch else 'OFF'} | LIVE_CONFIRMATION={'ON' if live_confirmation else 'OFF'}")
+    logger.info(
+        f"KILL_SWITCH={'ON' if kill_switch else 'OFF'} | "
+        f"LIVE_CONFIRMATION={'ON' if live_confirmation else 'OFF'}"
+    )
 
     ensure_signal_outbox_exists(SIGNAL_OUTBOX_PATH)
 
     engine = ExecutionEngine()
-    engine.startup_sync()  # ამას ქვემოთ გავასწორებთ რომ რეალური sync იყოს
+    engine.startup_sync()
 
     while True:
-        sig = pop_next_signal(SIGNAL_OUTBOX_PATH)  # ✅ FIFO + ამოღება
+        # 🧠 1) Brain step — try to generate a signal
+        try:
+            generated = run_once(SIGNAL_OUTBOX_PATH)
+            if generated:
+                logger.info("SIGNAL_GENERATOR | signal created")
+        except Exception as e:
+            logger.exception(f"SIGNAL_GENERATOR ERROR | {e}")
+
+        # 📥 2) Hands step — read next signal
+        sig = pop_next_signal(SIGNAL_OUTBOX_PATH)
 
         if not sig:
             logger.info("Worker alive, waiting for SIGNAL_OUTBOX...")
@@ -37,10 +61,12 @@ def run_worker() -> None:
         verdict = str(sig.get("final_verdict", "UNKNOWN"))
         logger.info(f"Signal received | id={signal_id} | verdict={verdict}")
 
+        # ⚙️ 3) Execution step
         try:
             engine.execute_signal(sig)
         except Exception as e:
             logger.exception(f"EXECUTION ERROR | id={signal_id} err={e}")
+
 
 if __name__ == "__main__":
     run_worker()
