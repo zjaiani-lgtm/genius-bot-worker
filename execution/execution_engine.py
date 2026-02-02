@@ -38,26 +38,37 @@ def _to_bool01(v: Any) -> bool:
     return False
 
 
+def _floor_to_step(value: float, step: float) -> float:
+    """
+    Floors value to a given step (e.g. 0.000001).
+    """
+    if step <= 0:
+        return float(value)
+    n = int(value / step)
+    return float(n * step)
+
+
 class ExecutionEngine:
     def __init__(self):
         self.mode = os.getenv("MODE", "DEMO").upper()  # DEMO | TESTNET | LIVE
         self.env_kill_switch = os.getenv("KILL_SWITCH", "false").lower() == "true"
         self.live_confirmation = os.getenv("LIVE_CONFIRMATION", "false").lower() == "true"
 
-        # Read-only feed (safe)
         self.price_feed = ccxt.binance({"enableRateLimit": True})
 
-        # LIVE/TESTNET execution client
         self.exchange = None
         if self.mode in ("LIVE", "TESTNET"):
             from execution.exchange_client import BinanceSpotClient
             self.exchange = BinanceSpotClient()
 
-        # Optional debug
         self.state_debug = os.getenv("STATE_DEBUG", "false").lower() == "true"
 
-        # For LIVE: after BUY, place a LIMIT SELL to show as OPEN ORDER
-        self.tp_pct = float(os.getenv("TP_PCT", "0.30"))  # 0.30% default
+        # Place LIMIT sell after BUY so you can see OPEN ORDER on Binance
+        self.tp_pct = float(os.getenv("TP_PCT", "0.30"))  # 0.30%
+
+        # Sell sizing safety
+        self.sell_buffer = float(os.getenv("SELL_BUFFER", "0.999"))  # keep tiny dust to avoid insufficient
+        self.sell_retry_buffer = float(os.getenv("SELL_RETRY_BUFFER", "0.995"))  # if first sell fails
 
     def _load_system_state(self) -> Dict[str, Any]:
         raw = get_system_state()
@@ -189,8 +200,8 @@ class ExecutionEngine:
             log_event("REJECT_BAD_PAYLOAD", f"{signal_id} missing symbol")
             return
 
-        # Spot safety: we only allow LONG (buy then sell). SHORT is not supported safely here.
-        if direction not in ("LONG",):
+        # Spot: allow only LONG (buy -> sell)
+        if direction != "LONG":
             logger.warning(f"EXEC_REJECT | unsupported direction for SPOT={direction} | id={signal_id}")
             log_event("REJECT_BAD_PAYLOAD", f"{signal_id} unsupported direction={direction}")
             return
@@ -208,10 +219,8 @@ class ExecutionEngine:
             try:
                 last_price = self._get_last_price(symbol)
                 base_size = float(position_size) if position_size is not None else float(quote_amount) / float(last_price)
-
                 resp = simulate_market_entry(symbol=symbol, side=direction, size=base_size, price=last_price)
                 bal = get_balance()
-
                 logger.info(f"EXEC_DEMO_OK | id={signal_id} resp={resp} wallet_balance={bal}")
                 log_event("TRADE_EXECUTED", f"{signal_id} DEMO {symbol} {direction} size={base_size} price={last_price}")
                 return
@@ -227,40 +236,63 @@ class ExecutionEngine:
             return
 
         try:
-            # Prefer quote_amount if provided (safer with small USDT)
+            # Compute quote_amount if absent
             if quote_amount is None:
-                # fallback: convert base size to quote by last price (still will place market buy by quote)
                 last = self.exchange.fetch_last_price(symbol)
                 quote_amount = float(position_size) * float(last)
 
             quote_amount = float(quote_amount)
 
-            # 1) BUY market by quote (so you control USDT spend)
+            # 1) BUY market by quote
             buy = self.exchange.place_market_buy_by_quote(symbol=symbol, quote_amount=quote_amount)
             logger.info(f"EXEC_LIVE_BUY_OK | id={signal_id} symbol={symbol} quote={quote_amount} resp={buy}")
             log_event("TRADE_EXECUTED", f"{signal_id} {self.mode} BUY {symbol} quote={quote_amount}")
 
-            # 2) Place LIMIT SELL as take-profit to show an OPEN ORDER on Binance
+            # 2) SELL LIMIT using FREE balance (fee-safe)
             last_price = self.exchange.fetch_last_price(symbol)
             tp_price = float(last_price) * (1.0 + (self.tp_pct / 100.0))
 
-            # Extract filled base amount (best-effort)
-            filled_base = None
+            base_asset = symbol.split("/")[0].upper()
+
+            # fetch free balance (this accounts for fee & exact fill)
+            bal = self.exchange.exchange.fetch_balance()
+            free_base = float((bal.get("free", {}) or {}).get(base_asset, 0.0) or 0.0)
+
+            # apply buffer to avoid insufficient due to rounding/fees
+            sell_amount_raw = free_base * float(self.sell_buffer)
+
+            # floor to amount step (precision)
+            market = self.exchange.exchange.market(symbol)
+            step = 10 ** (-int(market.get("precision", {}).get("amount", 8)))
+            sell_amount = _floor_to_step(sell_amount_raw, step)
+
+            if sell_amount <= 0:
+                raise Exception(f"SELL amount computed <= 0 | free_{base_asset}={free_base}")
+
+            # try place limit sell
             try:
-                filled_base = float(buy.get("filled") or 0.0)  # sometimes ccxt provides filled in base units
-            except Exception:
-                filled_base = 0.0
+                sell = self.exchange.place_limit_sell_amount(symbol=symbol, base_amount=sell_amount, price=tp_price)
+                logger.info(f"EXEC_LIVE_SELL_LIMIT_OK | id={signal_id} symbol={symbol} amount={sell_amount} tp_price={tp_price} resp={sell}")
+                log_event("ORDER_PLACED", f"{signal_id} {self.mode} SELL_LIMIT {symbol} amount={sell_amount} price={tp_price}")
+                return
+            except Exception as e:
+                # one retry with slightly smaller buffer
+                logger.warning(f"SELL_LIMIT_FAILED_FIRST | id={signal_id} err={e} -> retry smaller")
+                sell_amount_raw2 = free_base * float(self.sell_retry_buffer)
+                sell_amount2 = _floor_to_step(sell_amount_raw2, step)
 
-            # If filled_base not provided, estimate from quote/price
-            if not filled_base or filled_base <= 0:
-                filled_base = float(quote_amount) / float(last_price)
+                if sell_amount2 <= 0:
+                    raise
 
-            sell = self.exchange.place_limit_sell_amount(symbol=symbol, base_amount=filled_base, price=tp_price)
-            logger.info(f"EXEC_LIVE_SELL_LIMIT_OK | id={signal_id} symbol={symbol} amount={filled_base} tp_price={tp_price} resp={sell}")
-            log_event("ORDER_PLACED", f"{signal_id} {self.mode} SELL_LIMIT {symbol} amount={filled_base} price={tp_price}")
+                sell2 = self.exchange.place_limit_sell_amount(symbol=symbol, base_amount=sell_amount2, price=tp_price)
+                logger.info(f"EXEC_LIVE_SELL_LIMIT_OK_RETRY | id={signal_id} symbol={symbol} amount={sell_amount2} tp_price={tp_price} resp={sell2}")
+                log_event("ORDER_PLACED", f"{signal_id} {self.mode} SELL_LIMIT_RETRY {symbol} amount={sell_amount2} price={tp_price}")
+                return
 
         except Exception as e:
             logger.exception(f"EXEC_LIVE_ERROR | id={signal_id} err={e}")
+            # IMPORTANT: don't always PAUSE system for sell failure;
+            # but keeping your current behavior for safety
             update_system_state(status="PAUSED", startup_sync_ok=False)
             log_event("EXEC_LIVE_ERROR", f"{signal_id} err={e}")
             return
