@@ -3,13 +3,21 @@ import os
 import logging
 from typing import Any, Dict
 
+import ccxt
+
 from execution.db.repository import (
     get_system_state,
     update_system_state,
     log_event,
 )
 from execution.db.db import get_connection
-from execution.virtual_wallet import VirtualWallet  # make sure you have this
+
+# ✅ YOUR virtual_wallet (functions, no class)
+from execution.virtual_wallet import (
+    get_balance,
+    simulate_market_entry,
+    simulate_market_close,
+)
 
 logger = logging.getLogger("gbm")
 
@@ -20,8 +28,8 @@ class ExecutionEngine:
         self.env_kill_switch = os.getenv("KILL_SWITCH", "false").lower() == "true"
         self.live_confirmation = os.getenv("LIVE_CONFIRMATION", "false").lower() == "true"
 
-        # DEMO wallet
-        self.wallet = VirtualWallet()
+        # Read-only exchange for price discovery (safe for DEMO)
+        self.price_feed = ccxt.binance({"enableRateLimit": True})
 
         # Optional: wire exchange client for LIVE later
         # from execution.exchange_client import BinanceSpotClient
@@ -93,6 +101,13 @@ class ExecutionEngine:
             logger.info("STARTUP_SYNC: OK")
         else:
             logger.warning("STARTUP_SYNC: FAILED -> system PAUSED (NO TRADE)")
+
+    # -----------------------------
+    # Price helper (DEMO)
+    # -----------------------------
+    def _get_last_price(self, symbol: str) -> float:
+        t = self.price_feed.fetch_ticker(symbol)
+        return float(t["last"])
 
     # -----------------------------
     # Main execution
@@ -190,33 +205,43 @@ class ExecutionEngine:
             log_event("REJECT_BAD_PAYLOAD", f"{signal_id} missing quote_amount/position_size")
             return
 
-        side = "buy" if direction == "LONG" else "sell"
+        side_txt = "buy" if direction == "LONG" else "sell"
         logger.info(
-            f"EXEC_PARSED | id={signal_id} symbol={symbol} side={side} quote_amount={quote_amount} position_size={position_size}"
+            f"EXEC_PARSED | id={signal_id} symbol={symbol} dir={direction} side={side_txt} "
+            f"quote_amount={quote_amount} position_size={position_size}"
         )
 
         # 5) execute
         if self.mode == "DEMO":
-            # DEMO: execute via VirtualWallet
-            # VirtualWallet should simulate market fill price internally (or via ccxt ticker)
             try:
-                if position_size is None:
-                    # If you provided quote_amount only, you can convert using wallet's price method (if exists)
-                    # For now, block to avoid wrong sizing.
-                    logger.warning(f"EXEC_DEMO_REJECT | quote_amount-only not supported in wallet yet | id={signal_id}")
-                    log_event("EXEC_DEMO_REJECT", f"{signal_id} quote_amount_only_not_supported")
-                    return
+                # If only quote_amount provided, you can convert using last price
+                last_price = self._get_last_price(symbol)
 
-                res = self.wallet.open_trade(symbol=symbol, side=direction, size=float(position_size))
-                logger.info(f"EXEC_DEMO_OK | id={signal_id} {res}")
-                log_event("TRADE_EXECUTED", f"{signal_id} DEMO {symbol} {side} size={position_size}")
+                if position_size is None:
+                    # base_size = quote_amount / price
+                    base_size = float(quote_amount) / float(last_price)
+                else:
+                    base_size = float(position_size)
+
+                # Use your wallet simulation: requires explicit price
+                resp = simulate_market_entry(
+                    symbol=symbol,
+                    side=direction,
+                    size=base_size,
+                    price=last_price,
+                )
+
+                bal = get_balance()
+                logger.info(f"EXEC_DEMO_OK | id={signal_id} resp={resp} wallet_balance={bal}")
+                log_event("TRADE_EXECUTED", f"{signal_id} DEMO {symbol} {direction} size={base_size} price={last_price}")
                 return
+
             except Exception as e:
                 logger.exception(f"EXEC_DEMO_ERROR | id={signal_id} err={e}")
                 log_event("EXEC_DEMO_ERROR", f"{signal_id} err={e}")
                 return
 
-        # LIVE/TESTNET (blocked unless exchange is wired)
+        # LIVE/TESTNET: still blocked unless exchange wired
         if self.exchange is None:
             logger.warning(f"EXEC_BLOCKED | exchange client not wired | id={signal_id}")
             log_event("EXEC_BLOCKED_NO_EXCHANGE", f"{signal_id} exchange=None")
@@ -224,9 +249,9 @@ class ExecutionEngine:
 
         try:
             amount = float(position_size) if position_size is not None else None
-            resp = self.exchange.place_market_order(symbol=symbol, side=side, size=amount)
+            resp = self.exchange.place_market_order(symbol=symbol, side=side_txt, size=amount)
             logger.info(f"EXEC_LIVE_OK | id={signal_id} resp_status={resp.get('status')}")
-            log_event("TRADE_EXECUTED", f"{signal_id} LIVE {symbol} {side} size={amount}")
+            log_event("TRADE_EXECUTED", f"{signal_id} LIVE {symbol} {side_txt} size={amount}")
         except Exception as e:
             logger.exception(f"EXEC_LIVE_ERROR | id={signal_id} err={e}")
             update_system_state(status="PAUSED", startup_sync_ok=False)
