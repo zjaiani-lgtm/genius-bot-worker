@@ -3,7 +3,7 @@
 import os
 import time
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import ccxt
 
@@ -20,20 +20,17 @@ class BinanceSpotClient:
     """
     Binance Spot client with TESTNET support (ccxt).
 
-    ✅ Key rules:
-      - Never overwrite exchange.urls["api"] entirely (keep sapi/wapi keys).
-      - In TESTNET, patch only urls["api"]["public/private"].
-      - Do NOT call load_markets() inside __init__ (avoid startup auth side-effects).
-      - Provide two-phase startup checks:
-          1) public endpoints (no API key)
-          2) private endpoints (API key required)
+    Goals:
+      - Stable init (no private calls in __init__)
+      - Patch only urls["api"]["public/private"] (do NOT overwrite dict)
+      - Two-phase health checks: public-first then private
+      - Lazy market loading for when you actually need symbols / trading
     """
 
     MODE_DEMO = "DEMO"
     MODE_TESTNET = "TESTNET"
     MODE_LIVE = "LIVE"
 
-    # Default bases (spot REST v3)
     DEFAULT_TESTNET_REST_BASE = "https://testnet.binance.vision/api/v3"
     DEFAULT_DEMO_REST_BASE = "https://demo-api.binance.com/api/v3"
     DEFAULT_LIVE_REST_BASE = "https://api.binance.com/api/v3"
@@ -43,26 +40,26 @@ class BinanceSpotClient:
         self.kill_switch = os.getenv("KILL_SWITCH", "false").strip().lower() == "true"
         self.live_confirmation = os.getenv("LIVE_CONFIRMATION", "false").strip().lower() == "true"
 
-        api_key = os.getenv("BINANCE_API_KEY", "").strip()
-        api_secret = os.getenv("BINANCE_API_SECRET", "").strip()
+        self.api_key = os.getenv("BINANCE_API_KEY", "").strip()
+        self.api_secret = os.getenv("BINANCE_API_SECRET", "").strip()
 
-        # DEMO mode (your own virtual wallet) may run without keys.
-        if self.mode in (self.MODE_TESTNET, self.MODE_LIVE) and (not api_key or not api_secret):
+        # In DEMO mode (your virtual wallet) keys are optional.
+        if self.mode in (self.MODE_TESTNET, self.MODE_LIVE) and (not self.api_key or not self.api_secret):
             raise ExchangeClientError("Missing BINANCE_API_KEY / BINANCE_API_SECRET for TESTNET/LIVE")
 
         self.exchange = ccxt.binance({
-            "apiKey": api_key,
-            "secret": api_secret,
+            "apiKey": self.api_key,
+            "secret": self.api_secret,
             "enableRateLimit": True,
             "options": {
                 "defaultType": "spot",
-                # IMPORTANT: prevents ccxt from calling SAPI-heavy currency endpoints.
+                # prevents ccxt from calling some SAPI-heavy currency endpoints
                 "fetchCurrencies": False,
                 "adjustForTimeDifference": True,
             },
         })
 
-        # Defensive: ensure sandbox is OFF (some codebases accidentally flip it)
+        # defensive: sandbox OFF
         if hasattr(self.exchange, "set_sandbox_mode"):
             try:
                 self.exchange.set_sandbox_mode(False)
@@ -74,7 +71,6 @@ class BinanceSpotClient:
         elif self.mode == self.MODE_LIVE:
             self._apply_live_urls()
 
-        # Do NOT load markets here. We'll do it lazily.
         self._markets_loaded = False
 
     # ---------------- URL overrides ----------------
@@ -84,9 +80,8 @@ class BinanceSpotClient:
         ENV:
           BINANCE_TESTNET_REST_BASE=https://testnet.binance.vision/api/v3
           BINANCE_TESTNET_REST_BASE=https://demo-api.binance.com/api/v3
-
         Optional:
-          BINANCE_USE_DEMO=true (if base not set)
+          BINANCE_USE_DEMO=true (if ENV base not set)
         """
         base = os.getenv("BINANCE_TESTNET_REST_BASE", "").strip()
         if not base:
@@ -95,30 +90,44 @@ class BinanceSpotClient:
 
         base = base.rstrip("/")
 
-        # ✅ CRITICAL: do NOT overwrite urls["api"] dict — patch only public/private
+        # patch only public/private, keep rest of dict (sapi/wapi etc)
         if "api" not in self.exchange.urls or not isinstance(self.exchange.urls["api"], dict):
             self.exchange.urls["api"] = {}
-
         self.exchange.urls["api"]["public"] = base
         self.exchange.urls["api"]["private"] = base
 
     def _apply_live_urls(self) -> None:
         base = os.getenv("BINANCE_LIVE_REST_BASE", self.DEFAULT_LIVE_REST_BASE).strip() or self.DEFAULT_LIVE_REST_BASE
         base = base.rstrip("/")
-
         if "api" not in self.exchange.urls or not isinstance(self.exchange.urls["api"], dict):
             self.exchange.urls["api"] = {}
-
         self.exchange.urls["api"]["public"] = base
         self.exchange.urls["api"]["private"] = base
+
+    # ---------------- diagnostics ----------------
+
+    def diagnostics(self) -> Dict[str, Any]:
+        """
+        Safe debug payload (never prints full secrets).
+        """
+        base_public = None
+        try:
+            base_public = self.exchange.urls.get("api", {}).get("public")
+        except Exception:
+            pass
+
+        key_prefix = self.api_key[:6] + "..." if self.api_key else None
+        return {
+            "mode": self.mode,
+            "base_public": base_public,
+            "key_len": len(self.api_key),
+            "secret_len": len(self.api_secret),
+            "key_prefix": key_prefix,
+        }
 
     # ---------------- markets ----------------
 
     def ensure_markets_loaded(self) -> None:
-        """
-        Lazy-load markets only when needed.
-        This avoids startup failing due to auth-related side effects in some ccxt/binance combos.
-        """
         if self._markets_loaded:
             return
         try:
@@ -135,45 +144,31 @@ class BinanceSpotClient:
         if not self.live_confirmation:
             raise LiveTradingBlocked("LIVE_CONFIRMATION=false -> trading blocked")
 
-    # ---------------- startup checks ----------------
+    # ---------------- health checks ----------------
 
     def public_health_check(self) -> Dict[str, Any]:
         """
-        Public-only connectivity test (NO API KEY required).
-        This is the check that should pass first in STARTUP_SYNC.
+        No API key required.
+        Confirms endpoint correctness.
         """
         try:
-            # /api/v3/ping
             self.exchange.publicGetPing()
-
-            # /api/v3/exchangeInfo (returns symbols list)
             info = self.exchange.publicGetExchangeInfo()
             symbols_count = len(info.get("symbols", [])) if isinstance(info, dict) else None
-
             return {"ok": True, "symbols": symbols_count}
         except Exception as e:
             raise ExchangeClientError(f"public_health_check failed | err={e}") from e
 
     def private_health_check(self) -> Dict[str, Any]:
         """
-        Private connectivity test (API KEY required).
-        This is where invalid key/secret will show up (-2008 etc).
+        Requires valid API key/secret for the selected environment.
         """
         try:
             bal = self.exchange.fetch_balance()
-            # Keep response small
-            total = bal.get("total", {}) if isinstance(bal, dict) else {}
-            return {"ok": True, "has_total": bool(total)}
+            free = bal.get("free", {}) if isinstance(bal, dict) else {}
+            return {"ok": True, "free_keys": list(free.keys())[:5]}
         except Exception as e:
-            raise ExchangeClientError(f"private_health_check failed | err={e}") from e
-
-    def health_check(self) -> Dict[str, Any]:
-        """
-        Combined check (optional). Useful when you want "EXCHANGE_OK" in one call.
-        """
-        pub = self.public_health_check()
-        priv = self.private_health_check()
-        return {"ok": True, "public": pub, "private": priv}
+            raise ExchangeClientError(f"fetch_balance failed | err={e}") from e
 
     # ---------------- read ----------------
 
@@ -200,16 +195,11 @@ class BinanceSpotClient:
         quote_amount: float,
         client_order_id: Optional[str] = None
     ) -> Dict[str, Any]:
-        """
-        Spend QUOTE amount (e.g. 10 USDT) to buy BASE (BTC).
-        Uses Binance param: quoteOrderQty.
-        """
         self._require_trade_allowed()
 
         if quote_amount <= 0:
             raise ExchangeClientError("quote_amount must be > 0")
 
-        # Ensure markets are available (symbol formatting, etc.)
         self.ensure_markets_loaded()
 
         cid = client_order_id or self._new_client_order_id("buy")
@@ -228,9 +218,6 @@ class BinanceSpotClient:
         base_amount: float,
         client_order_id: Optional[str] = None
     ) -> Dict[str, Any]:
-        """
-        Sell BASE amount (e.g. 0.0002 BTC) back to QUOTE (USDT).
-        """
         self._require_trade_allowed()
 
         if base_amount <= 0:
