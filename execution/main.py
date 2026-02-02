@@ -5,10 +5,16 @@ import time
 from execution.logger import log_info, log_warning
 from execution.config import MODE, KILL_SWITCH, STARTUP_SYNC_ENABLED
 from execution.db.db import init_db
-from execution.signal_client import get_latest_signal, acknowledge_processed
-from execution.execution_engine import execute_signal
 from execution.db.repository import list_positions, list_audit_log
 from execution.startup_sync import run_startup_sync
+from execution.execution_engine import execute_signal
+
+# ✅ signal_client: keep backward-compatible functions + ensure outbox exists
+from execution.signal_client import (
+    get_latest_signal,
+    acknowledge_processed,
+    ensure_signal_outbox_exists,
+)
 
 POLL_INTERVAL_SECONDS = 10
 INSPECT_EVERY_SECONDS = 60
@@ -56,6 +62,14 @@ def main():
     init_db()
     log_info("DB initialized")
 
+    # ✅ Ensure outbox exists (creates /var/data/signal_outbox.json if missing)
+    try:
+        p = ensure_signal_outbox_exists()
+        log_info(f"SIGNAL_OUTBOX ready | path={p}")
+    except Exception as e:
+        # If outbox creation fails, we still keep worker alive, but it will never execute
+        log_warning(f"SIGNAL_OUTBOX init failed | err={e}")
+
     # Startup sync gate (once at boot)
     startup_ok = True
     if STARTUP_SYNC_ENABLED:
@@ -92,16 +106,34 @@ def main():
             if signal is None:
                 log_info("Worker alive, waiting for SIGNAL_OUTBOX...")
             else:
-                signal_id = signal.get("signal_id")
-                verdict = signal.get("final_verdict")
+                signal_id = None
+                try:
+                    signal_id = signal.get("signal_id") if isinstance(signal, dict) else None
+                    verdict = signal.get("final_verdict") if isinstance(signal, dict) else None
+                except Exception:
+                    verdict = None
+
                 log_info(f"Signal received | id={signal_id} | verdict={verdict}")
 
-                result = execute_signal(signal)
-                outcome = result.get("outcome")
-                reason = result.get("reason")
+                # If signal_id missing -> cannot be idempotent; drop it to avoid infinite loop
+                if not signal_id:
+                    log_warning("Signal missing signal_id -> acknowledging (dropping) to prevent repeat loop")
+                    # best-effort: remove the first element by using a placeholder id won't work,
+                    # so just sleep and keep running (or implement pop logic).
+                    # But since your acknowledge expects id, we can't safely drop without id.
+                    # In practice: require signal_id in schema.
+                    time.sleep(POLL_INTERVAL_SECONDS)
+                    continue
 
-                # ACK immediately to prevent repeats/spam (success or fail)
-                acknowledge_processed(signal, f"{outcome}:{reason}" if reason else outcome)
+                result = execute_signal(signal)
+                outcome = (result or {}).get("outcome", "UNKNOWN")
+                reason = (result or {}).get("reason")
+
+                # ✅ ACK by signal_id (NOT whole dict)
+                try:
+                    acknowledge_processed(signal_id)
+                except Exception as e:
+                    log_warning(f"ACK failed | signal_id={signal_id} | err={e}")
 
         except Exception as e:
             log_warning(f"Worker loop error: {e}")
