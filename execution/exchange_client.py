@@ -17,18 +17,6 @@ class LiveTradingBlocked(Exception):
 
 
 class BinanceSpotClient:
-    """
-    Binance Spot client supporting:
-      - DEMO: blocked (should not be called)
-      - TESTNET: uses testnet REST base URL
-      - LIVE: uses production REST base URL
-
-    Safety gates:
-      - KILL_SWITCH=true blocks
-      - LIVE_CONFIRMATION=true required for LIVE
-      - MAX_QUOTE_PER_TRADE caps risk in USDT
-    """
-
     TESTNET_REST_BASE = "https://testnet.binance.vision/api"
 
     def __init__(self):
@@ -36,7 +24,7 @@ class BinanceSpotClient:
         self.kill_switch = os.getenv("KILL_SWITCH", "false").lower() == "true"
         self.live_confirmation = os.getenv("LIVE_CONFIRMATION", "false").lower() == "true"
 
-        self.max_quote_per_trade = float(os.getenv("MAX_QUOTE_PER_TRADE", "10"))  # risk cap
+        self.max_quote_per_trade = float(os.getenv("MAX_QUOTE_PER_TRADE", "10"))
         self.symbol_whitelist = set(
             s.strip().upper()
             for s in os.getenv("SYMBOL_WHITELIST", "BTC/USDT").split(",")
@@ -50,7 +38,6 @@ class BinanceSpotClient:
             if not api_key or not api_secret:
                 raise ExchangeClientError("Missing BINANCE_API_KEY / BINANCE_API_SECRET for LIVE/TESTNET.")
 
-        # Spot exchange (ccxt)
         self.exchange = ccxt.binance({
             "apiKey": api_key,
             "secret": api_secret,
@@ -58,13 +45,11 @@ class BinanceSpotClient:
             "options": {"defaultType": "spot"},
         })
 
-        # TESTNET override
         if self.mode == "TESTNET":
             self.exchange.urls["api"] = {
                 "public": self.TESTNET_REST_BASE,
                 "private": self.TESTNET_REST_BASE,
             }
-            # On Binance testnet, some SAPI endpoints fail; avoid fetchCurrencies auto-calls.
             self.exchange.options["fetchCurrencies"] = False
 
     def _guard(self, symbol: str, quote_amount: Optional[float] = None) -> None:
@@ -81,52 +66,47 @@ class BinanceSpotClient:
                 f"quote_amount {quote_amount} exceeds MAX_QUOTE_PER_TRADE={self.max_quote_per_trade}"
             )
 
+    # ✅ ADD THIS (startup_sync uses it)
+    def diagnostics(self) -> Dict[str, Any]:
+        """
+        Lightweight connectivity + permissions check (no trading).
+        Safe for LIVE: fetch balance & ticker.
+        """
+        try:
+            # ensure credentials are usable (private endpoint)
+            bal = self.exchange.fetch_balance()
+            # ensure public endpoint works
+            sym = next(iter(self.symbol_whitelist)) if self.symbol_whitelist else "BTC/USDT"
+            t = self.exchange.fetch_ticker(sym)
+            return {
+                "mode": self.mode,
+                "kill_switch": self.kill_switch,
+                "live_confirmation": self.live_confirmation,
+                "symbol_probe": sym,
+                "last_price": float(t.get("last") or 0.0),
+                "usdt_free": float((bal.get("free", {}) or {}).get("USDT", 0.0) or 0.0),
+                "ok": True,
+            }
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
     def fetch_last_price(self, symbol: str) -> float:
         t = self.exchange.fetch_ticker(symbol)
         return float(t["last"])
 
-    def fetch_free_balance(self, asset: str) -> float:
-        bal = self.exchange.fetch_balance()
-        free = bal.get("free", {}) or {}
-        return float(free.get(asset, 0.0) or 0.0)
-
     def place_market_buy_by_quote(self, symbol: str, quote_amount: float) -> Dict[str, Any]:
-        """
-        Market BUY using quote amount (USDT).
-        Uses 'quoteOrderQty' (Binance supports it). ccxt passes params.
-        """
         self._guard(symbol, quote_amount=quote_amount)
-
         try:
             params = {"quoteOrderQty": float(quote_amount)}
-            order = self.exchange.create_order(symbol, "market", "buy", None, None, params)
-            return order
+            return self.exchange.create_order(symbol, "market", "buy", None, None, params)
         except Exception as e:
             raise ExchangeClientError(f"Market buy failed: {e}")
 
-    def place_market_sell_amount(self, symbol: str, base_amount: float) -> Dict[str, Any]:
-        """
-        Market SELL using base amount (e.g. BTC amount).
-        """
-        self._guard(symbol)
-
-        try:
-            amt = float(self.exchange.amount_to_precision(symbol, base_amount))
-            order = self.exchange.create_order(symbol, "market", "sell", float(amt), None)
-            return order
-        except Exception as e:
-            raise ExchangeClientError(f"Market sell failed: {e}")
-
     def place_limit_sell_amount(self, symbol: str, base_amount: float, price: float) -> Dict[str, Any]:
-        """
-        LIMIT SELL that will likely remain open (if price > current last).
-        """
         self._guard(symbol)
-
         try:
             amt = float(self.exchange.amount_to_precision(symbol, base_amount))
             px = float(self.exchange.price_to_precision(symbol, price))
-            order = self.exchange.create_order(symbol, "limit", "sell", float(amt), float(px))
-            return order
+            return self.exchange.create_order(symbol, "limit", "sell", float(amt), float(px))
         except Exception as e:
             raise ExchangeClientError(f"Limit sell failed: {e}")
