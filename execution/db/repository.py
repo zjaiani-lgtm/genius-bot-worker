@@ -1,17 +1,35 @@
 # execution/db/repository.py
-
 from datetime import datetime
+from typing import Optional, Dict, Any
 from execution.db.db import get_connection
 
 # ---------------- SYSTEM STATE ----------------
 
-def get_system_state():
+def get_system_state() -> Optional[Dict[str, Any]]:
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("SELECT * FROM system_state WHERE id = 1")
     row = cur.fetchone()
     conn.close()
-    return row
+
+    if row is None:
+        return None
+
+    # With row_factory=sqlite3.Row this becomes a dict cleanly
+    try:
+        return dict(row)
+    except Exception:
+        # Backward compatibility if row_factory not applied for some reason
+        # row might be a tuple: (id, status, startup_sync_ok, kill_switch, updated_at)
+        if isinstance(row, (list, tuple)):
+            return {
+                "id": row[0] if len(row) > 0 else 1,
+                "status": row[1] if len(row) > 1 else "RUNNING",
+                "startup_sync_ok": row[2] if len(row) > 2 else 0,
+                "kill_switch": row[3] if len(row) > 3 else 0,
+                "updated_at": row[4] if len(row) > 4 else None,
+            }
+        return None
 
 def update_system_state(status=None, startup_sync_ok=None, kill_switch=None):
     conn = get_connection()
@@ -22,15 +40,15 @@ def update_system_state(status=None, startup_sync_ok=None, kill_switch=None):
 
     if status is not None:
         fields.append("status = ?")
-        values.append(status)
+        values.append(str(status))
 
     if startup_sync_ok is not None:
         fields.append("startup_sync_ok = ?")
-        values.append(int(startup_sync_ok))
+        values.append(1 if bool(startup_sync_ok) else 0)
 
     if kill_switch is not None:
         fields.append("kill_switch = ?")
-        values.append(int(kill_switch))
+        values.append(1 if bool(kill_switch) else 0)
 
     fields.append("updated_at = ?")
     values.append(datetime.utcnow().isoformat())
