@@ -1,7 +1,7 @@
 # execution/execution_engine.py
 import os
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import ccxt
 
@@ -12,7 +12,6 @@ from execution.db.repository import (
 )
 from execution.db.db import get_connection
 
-# ✅ YOUR virtual_wallet (functions, no class)
 from execution.virtual_wallet import (
     get_balance,
     simulate_market_entry,
@@ -20,6 +19,28 @@ from execution.virtual_wallet import (
 )
 
 logger = logging.getLogger("gbm")
+
+
+def _to_bool01(v: Any) -> bool:
+    """
+    Fail-safe bool parser:
+    - Accepts: 0/1, "0"/"1", True/False, "true"/"false", etc.
+    - Unknown strings (e.g. timestamps) => False
+    """
+    if v is None:
+        return False
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return int(v) != 0
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("1", "true", "yes", "y", "on"):
+            return True
+        if s in ("0", "false", "no", "n", "off", ""):
+            return False
+        return False
+    return False
 
 
 class ExecutionEngine:
@@ -32,41 +53,51 @@ class ExecutionEngine:
         self.price_feed = ccxt.binance({"enableRateLimit": True})
 
         # Optional: wire exchange client for LIVE later
-        # from execution.exchange_client import BinanceSpotClient
-        # self.exchange = BinanceSpotClient()
         self.exchange = None
+
+        # Optional debug for state raw dumps
+        self.state_debug = os.getenv("STATE_DEBUG", "false").lower() == "true"
 
     # -----------------------------
     # Helpers: system_state parsing
     # -----------------------------
-    def _state_get(self, state: Any, key: str, idx: int) -> Any:
-        """
-        Supports both dict-like and tuple-like returns from get_system_state().
-        Expected tuple order: (id, mode, status, kill_switch, startup_sync_ok, updated_at)
-        """
-        if state is None:
-            return None
-        if isinstance(state, dict):
-            return state.get(key)
-        if isinstance(state, (list, tuple)) and len(state) > idx:
-            return state[idx]
-        return None
-
     def _load_system_state(self) -> Dict[str, Any]:
-        state = get_system_state()
-        return {
-            "mode": self._state_get(state, "mode", 1),
-            "status": self._state_get(state, "status", 2),
-            "kill_switch": self._state_get(state, "kill_switch", 3),
-            "startup_sync_ok": self._state_get(state, "startup_sync_ok", 4),
-        }
+        raw = get_system_state()
+
+        if self.state_debug:
+            logger.info(f"SYSTEM_STATE_RAW | type={type(raw)} value={raw}")
+
+        # After DB fixes, repository will return dict (recommended)
+        if isinstance(raw, dict):
+            status = raw.get("status")
+            kill = raw.get("kill_switch")
+            sync = raw.get("startup_sync_ok")
+            return {
+                "status": str(status).upper() if status is not None else "",
+                "kill_switch": _to_bool01(kill),
+                "startup_sync_ok": _to_bool01(sync),
+            }
+
+        # Backward compatibility: tuple/list from sqlite without row_factory
+        # DB schema order: (id, status, startup_sync_ok, kill_switch, updated_at)
+        if isinstance(raw, (list, tuple)):
+            status = raw[1] if len(raw) > 1 else ""
+            sync = raw[2] if len(raw) > 2 else 0
+            kill = raw[3] if len(raw) > 3 else 0
+            return {
+                "status": str(status).upper() if status is not None else "",
+                "kill_switch": _to_bool01(kill),
+                "startup_sync_ok": _to_bool01(sync),
+            }
+
+        return {"status": "", "kill_switch": False, "startup_sync_ok": False}
 
     # -----------------------------
     # Idempotency (DB audit_log)
     # -----------------------------
     def _audit_has_signal(self, signal_id: str) -> bool:
         """
-        True if this signal_id already processed (SEEN or EXECUTED).
+        True if this signal_id already processed (SEEN/EXECUTED).
         Fail-safe: if check fails -> block.
         """
         if not signal_id:
@@ -151,15 +182,16 @@ class ExecutionEngine:
         # 2) system gates (DB + ENV)
         state = self._load_system_state()
         db_status = str(state.get("status") or "").upper()
-        db_kill_switch = bool(int(state.get("kill_switch") or 0))
-        startup_sync_ok = bool(int(state.get("startup_sync_ok") or 0))
+        db_kill_switch = bool(state.get("kill_switch"))
+        startup_sync_ok = bool(state.get("startup_sync_ok"))
 
         if self.env_kill_switch or db_kill_switch:
             logger.warning(f"EXEC_BLOCKED | KILL_SWITCH=ON | id={signal_id}")
             log_event("EXEC_BLOCKED_KILL_SWITCH", f"{signal_id} env={self.env_kill_switch} db={db_kill_switch}")
             return
 
-        if not startup_sync_ok or db_status != "ACTIVE":
+        # Accept ACTIVE or RUNNING (because DB default is RUNNING in your init_db)
+        if not startup_sync_ok or db_status not in ("ACTIVE", "RUNNING"):
             logger.warning(
                 f"EXEC_BLOCKED | system not ACTIVE/synced | id={signal_id} status={db_status} startup_sync_ok={startup_sync_ok}"
             )
@@ -214,16 +246,13 @@ class ExecutionEngine:
         # 5) execute
         if self.mode == "DEMO":
             try:
-                # If only quote_amount provided, you can convert using last price
                 last_price = self._get_last_price(symbol)
 
                 if position_size is None:
-                    # base_size = quote_amount / price
                     base_size = float(quote_amount) / float(last_price)
                 else:
                     base_size = float(position_size)
 
-                # Use your wallet simulation: requires explicit price
                 resp = simulate_market_entry(
                     symbol=symbol,
                     side=direction,
