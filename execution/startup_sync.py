@@ -26,7 +26,7 @@ def run_startup_sync() -> bool:
     - TESTNET / LIVE:
         - 1) Public connectivity check
         - 2) Private connectivity check (keys)
-        - If DB has OPEN positions -> PAUSE (until full reconcile is implemented)
+        - If DB has OPEN positions -> PAUSE (until reconcile is implemented)
         - If DB has no open positions -> ACTIVE
     """
 
@@ -37,7 +37,6 @@ def run_startup_sync() -> bool:
 
     try:
         st = get_system_state()
-        # supports dict or tuple
         db_kill = (st.get("kill_switch") if isinstance(st, dict) else st[3]) if st else 0
         db_kill = bool(int(db_kill))
     except Exception:
@@ -70,7 +69,6 @@ def run_startup_sync() -> bool:
     try:
         client = BinanceSpotClient()
 
-        # Safe diagnostics (no secrets)
         diag = client.diagnostics()
         log_info(
             f"STARTUP_SYNC: {mode} -> DIAG base={diag.get('base_public')} "
@@ -99,7 +97,6 @@ def run_startup_sync() -> bool:
                 if isinstance(p, dict):
                     preview.append(f"{p.get('symbol')} {p.get('side')} size={p.get('size')}")
                 else:
-                    # fallback if row/tuple-like
                     preview.append(str(p))
         except Exception:
             pass
