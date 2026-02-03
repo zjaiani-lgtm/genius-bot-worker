@@ -62,7 +62,11 @@ class ExecutionEngine:
             status = raw[1] if len(raw) > 1 else ""
             sync = raw[2] if len(raw) > 2 else 0
             kill = raw[3] if len(raw) > 3 else 0
-            return {"status": str(status or "").upper(), "startup_sync_ok": _to_bool01(sync), "kill_switch": _to_bool01(kill)}
+            return {
+                "status": str(status or "").upper(),
+                "startup_sync_ok": _to_bool01(sync),
+                "kill_switch": _to_bool01(kill)
+            }
 
         if isinstance(raw, dict):
             return {
@@ -74,7 +78,7 @@ class ExecutionEngine:
         return {"status": "", "startup_sync_ok": False, "kill_switch": False}
 
     # ----------------------------
-    # OCO reconcile (optional for native OCO)
+    # OCO reconcile (native OCO)
     # ----------------------------
     def reconcile_oco(self) -> None:
         if self.mode not in ("LIVE", "TESTNET"):
@@ -86,6 +90,12 @@ class ExecutionEngine:
         if not rows:
             return
 
+        def _norm(s: Any) -> str:
+            return str(s or "").strip().lower()
+
+        CLOSED = {"closed", "filled"}
+        CANCELED = {"canceled", "cancelled", "expired", "rejected"}
+
         for r in rows:
             (
                 link_id, signal_id, symbol, base_asset,
@@ -94,28 +104,46 @@ class ExecutionEngine:
                 amount, status, created_at, updated_at
             ) = r
 
+            # If ids are missing, we cannot reconcile reliably
+            if not tp_order_id or not sl_order_id:
+                logger.warning(f"OCO_RECONCILE_SKIP | link={link_id} missing order ids tp='{tp_order_id}' sl='{sl_order_id}'")
+                continue
+
             try:
                 tp = self.exchange.fetch_order(tp_order_id, symbol)
                 sl = self.exchange.fetch_order(sl_order_id, symbol)
 
-                tp_status = str(tp.get("status") or "").lower()
-                sl_status = str(sl.get("status") or "").lower()
+                tp_status = _norm(tp.get("status"))
+                sl_status = _norm(sl.get("status"))
 
                 logger.info(
                     f"OCO_RECONCILE | link={link_id} id={signal_id} symbol={symbol} "
                     f"tp={tp_order_id}:{tp_status} sl={sl_order_id}:{sl_status}"
                 )
 
-                # In native OCO, Binance should auto-cancel the opposite, but we still mark DB
-                if tp_status in ("closed", "filled"):
-                    set_oco_status(link_id, "CLOSED_TP")
-                    log_event("OCO_CLOSED", f"{signal_id} TP_FILLED tp={tp_order_id} sl={sl_order_id}")
+                # 1) SL executed -> OCO done (TP usually becomes expired/canceled)
+                if sl_status in CLOSED:
+                    set_oco_status(link_id, "CLOSED_SL")
+                    log_event("OCO_CLOSED", f"{signal_id} SL_FILLED sl={sl_order_id} tp={tp_order_id} tp_status={tp_status}")
                     continue
 
-                if sl_status in ("closed", "filled"):
-                    set_oco_status(link_id, "CLOSED_SL")
-                    log_event("OCO_CLOSED", f"{signal_id} SL_FILLED tp={tp_order_id} sl={sl_order_id}")
+                # 2) TP executed -> OCO done
+                if tp_status in CLOSED:
+                    set_oco_status(link_id, "CLOSED_TP")
+                    log_event("OCO_CLOSED", f"{signal_id} TP_FILLED tp={tp_order_id} sl={sl_order_id} sl_status={sl_status}")
                     continue
+
+                # 3) One canceled/expired but the other still open -> still ACTIVE
+                if (tp_status in CANCELED and sl_status == "open") or (sl_status in CANCELED and tp_status == "open"):
+                    continue
+
+                # 4) Both canceled/expired -> failed/aborted
+                if tp_status in CANCELED and sl_status in CANCELED:
+                    set_oco_status(link_id, "FAILED")
+                    log_event("OCO_FAILED", f"{signal_id} tp={tp_order_id}:{tp_status} sl={sl_order_id}:{sl_status}")
+                    continue
+
+                # else: keep ACTIVE
 
             except Exception as e:
                 logger.warning(f"OCO_RECONCILE_FAIL | link={link_id} symbol={symbol} err={e}")
@@ -232,25 +260,22 @@ class ExecutionEngine:
             )
 
             raw = oco.get("raw") or {}
-            # Binance OCO response typically has orderReports with 2 orders
             order_reports = raw.get("orderReports") or []
             tp_order_id = None
             sl_order_id = None
 
-            # best-effort parse
             for rep in order_reports:
                 typ = str(rep.get("type") or "").upper()
                 oid = str(rep.get("orderId") or rep.get("order_id") or "")
-                if "LIMIT_MAKER" in typ or typ == "LIMIT":
+                if not oid:
+                    continue
+                if "LIMIT" in typ:
                     tp_order_id = oid or tp_order_id
                 else:
-                    # STOP_LOSS_LIMIT leg
                     sl_order_id = oid or sl_order_id
 
-            # fallback: sometimes raw["orders"] has orderIds
             orders = raw.get("orders") or []
             if (not tp_order_id or not sl_order_id) and len(orders) >= 2:
-                # orders may include two entries with orderId
                 ids = [str(o.get("orderId") or "") for o in orders if o.get("orderId")]
                 if len(ids) >= 2:
                     tp_order_id = tp_order_id or ids[0]
@@ -259,7 +284,6 @@ class ExecutionEngine:
             logger.info(f"OCO_OK | id={signal_id} listOrderId={raw.get('listOrderId')} tp={tp_order_id} sl={sl_order_id}")
             log_event("OCO_ARMED", f"{signal_id} symbol={symbol} listOrderId={raw.get('listOrderId')} tp={tp_order_id} sl={sl_order_id} amount={sell_amount}")
 
-            # Save link (if parsing failed, still store placeholders)
             create_oco_link(
                 signal_id=signal_id,
                 symbol=symbol,
