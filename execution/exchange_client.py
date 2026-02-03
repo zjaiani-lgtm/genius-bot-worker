@@ -1,132 +1,131 @@
-# execution/exchange_client.py
 import os
+import time
+import uuid
 import logging
-from typing import Any, Dict, Optional
+from datetime import datetime
+from typing import Optional, Dict, Any, Tuple
 
 import ccxt
+from execution.signal_client import append_signal
 
 logger = logging.getLogger("gbm")
 
+SYMBOL = os.getenv("BOT_SYMBOL", "BTC/USDT")
+TIMEFRAME = os.getenv("BOT_TIMEFRAME", "1m")
+CANDLE_LIMIT = int(os.getenv("BOT_CANDLE_LIMIT", "50"))
+COOLDOWN_SECONDS = int(os.getenv("BOT_SIGNAL_COOLDOWN_SECONDS", "60"))
 
-class ExchangeClientError(Exception):
-    pass
+ALLOW_LIVE_SIGNALS = os.getenv("ALLOW_LIVE_SIGNALS", "false").lower() == "true"
+POSITION_SIZE = float(os.getenv("BOT_POSITION_SIZE", "0.0001"))
+CONFIDENCE = float(os.getenv("BOT_SIGNAL_CONFIDENCE", "0.55"))
 
+GEN_DEBUG = os.getenv("GEN_DEBUG", "true").lower() == "true"
+GEN_LOG_EVERY_TICK = os.getenv("GEN_LOG_EVERY_TICK", "true").lower() == "true"
 
-class LiveTradingBlocked(Exception):
-    pass
+_last_emit_ts: float = 0.0
+_last_signature: Optional[Tuple[str, str]] = None
 
+EXCHANGE = ccxt.binance({"enableRateLimit": True})
 
-class BinanceSpotClient:
-    TESTNET_REST_BASE = "https://testnet.binance.vision/api"
+def _now_utc_iso() -> str:
+    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
-    def __init__(self):
-        self.mode = os.getenv("MODE", "DEMO").upper()  # DEMO | TESTNET | LIVE
-        self.kill_switch = os.getenv("KILL_SWITCH", "false").lower() == "true"
-        self.live_confirmation = os.getenv("LIVE_CONFIRMATION", "false").lower() == "true"
+def generate_signal() -> Optional[Dict[str, Any]]:
+    try:
+        t0 = time.time()
+        ohlcv = EXCHANGE.fetch_ohlcv(SYMBOL, timeframe=TIMEFRAME, limit=CANDLE_LIMIT)
+        dt_ms = int((time.time() - t0) * 1000)
+        if GEN_DEBUG:
+            logger.info(f"[GEN] FETCH_OK | symbol={SYMBOL} tf={TIMEFRAME} candles={len(ohlcv) if ohlcv else 0} dt={dt_ms}ms")
+    except Exception as e:
+        logger.exception(f"[GEN] FETCH_FAIL | symbol={SYMBOL} tf={TIMEFRAME} err={e}")
+        return None
 
-        self.max_quote_per_trade = float(os.getenv("MAX_QUOTE_PER_TRADE", "10"))
-        self.symbol_whitelist = set(
-            s.strip().upper()
-            for s in os.getenv("SYMBOL_WHITELIST", "BTC/USDT").split(",")
-            if s.strip()
+    if not ohlcv or len(ohlcv) < 25:
+        if GEN_LOG_EVERY_TICK:
+            logger.info(f"[GEN] NO_SIGNAL | reason=not_enough_candles got={len(ohlcv) if ohlcv else 0} need>=25")
+        return None
+
+    closes = [c[4] for c in ohlcv]
+    last = float(closes[-1])
+    prev = float(closes[-2])
+    ma20 = float(sum(closes[-20:]) / 20.0)
+
+    cond_ma = last > ma20
+    cond_mom = last > prev
+
+    if GEN_LOG_EVERY_TICK:
+        logger.info(
+            f"[GEN] SNAPSHOT | last={last:.2f} prev={prev:.2f} ma20={ma20:.2f} "
+            f"cond(last>ma20)={cond_ma} cond(last>prev)={cond_mom}"
         )
 
-        api_key = os.getenv("BINANCE_API_KEY", "").strip()
-        api_secret = os.getenv("BINANCE_API_SECRET", "").strip()
+    if not (cond_ma and cond_mom):
+        if GEN_LOG_EVERY_TICK:
+            reason = []
+            if not cond_ma:
+                reason.append("last<=ma20")
+            if not cond_mom:
+                reason.append("last<=prev")
+            logger.info(f"[GEN] NO_SIGNAL | reason={','.join(reason) if reason else 'unknown'}")
+        return None
 
-        if self.mode in ("LIVE", "TESTNET"):
-            if not api_key or not api_secret:
-                raise ExchangeClientError("Missing BINANCE_API_KEY / BINANCE_API_SECRET for LIVE/TESTNET.")
+    mode_allowed = {"demo": True, "live": bool(ALLOW_LIVE_SIGNALS)}
+    signal_id = f"GBM-AUTO-{uuid.uuid4().hex}"
 
-        self.exchange = ccxt.binance({
-            "apiKey": api_key,
-            "secret": api_secret,
-            "enableRateLimit": True,
-            "options": {"defaultType": "spot"},
-        })
+    sig = {
+        "signal_id": signal_id,
+        "timestamp_utc": _now_utc_iso(),
+        "final_verdict": "TRADE",
+        "certified_signal": True,
+        "confidence": CONFIDENCE,
+        "mode_allowed": mode_allowed,
+        "execution": {
+            "symbol": SYMBOL,
+            "direction": "LONG",
+            "entry": {"type": "MARKET", "price": None},
+            "position_size": POSITION_SIZE,
+            "risk": {"stop_loss": None, "take_profit": None},
+        },
+    }
 
-        if self.mode == "TESTNET":
-            self.exchange.urls["api"] = {
-                "public": self.TESTNET_REST_BASE,
-                "private": self.TESTNET_REST_BASE,
-            }
-            self.exchange.options["fetchCurrencies"] = False
+    if GEN_DEBUG:
+        logger.info(f"[GEN] SIGNAL_READY | id={signal_id} verdict=TRADE symbol={SYMBOL} dir=LONG mode_allowed={mode_allowed} pos_size={POSITION_SIZE}")
 
-    def _guard(self, symbol: str, quote_amount: Optional[float] = None) -> None:
-        if self.kill_switch:
-            raise LiveTradingBlocked("KILL_SWITCH is ON.")
-        if self.mode == "LIVE" and not self.live_confirmation:
-            raise LiveTradingBlocked("LIVE_CONFIRMATION is OFF.")
-        if self.mode == "DEMO":
-            raise LiveTradingBlocked("MODE=DEMO -> exchange client must not execute real orders.")
-        if symbol and symbol.upper() not in self.symbol_whitelist:
-            raise LiveTradingBlocked(f"Symbol not allowed by whitelist: {symbol}.")
-        if quote_amount is not None and quote_amount > self.max_quote_per_trade:
-            raise LiveTradingBlocked(f"quote_amount {quote_amount} exceeds MAX_QUOTE_PER_TRADE={self.max_quote_per_trade}")
+    return sig
 
-    def diagnostics(self) -> Dict[str, Any]:
-        try:
-            bal = self.exchange.fetch_balance()
-            sym = next(iter(self.symbol_whitelist)) if self.symbol_whitelist else "BTC/USDT"
-            t = self.exchange.fetch_ticker(sym)
-            return {
-                "mode": self.mode,
-                "kill_switch": self.kill_switch,
-                "live_confirmation": self.live_confirmation,
-                "symbol_probe": sym,
-                "last_price": float(t.get("last") or 0.0),
-                "usdt_free": float((bal.get("free", {}) or {}).get("USDT", 0.0) or 0.0),
-                "ok": True,
-            }
-        except Exception as e:
-            return {"ok": False, "error": str(e)}
+def run_once(outbox_path: str) -> bool:
+    global _last_emit_ts, _last_signature
 
-    def fetch_last_price(self, symbol: str) -> float:
-        t = self.exchange.fetch_ticker(symbol)
-        return float(t["last"])
+    now = time.time()
+    elapsed = now - _last_emit_ts
 
-    def fetch_balance_free(self, asset: str) -> float:
-        bal = self.exchange.fetch_balance()
-        return float((bal.get("free", {}) or {}).get(asset.upper(), 0.0) or 0.0)
+    if elapsed < COOLDOWN_SECONDS:
+        if GEN_DEBUG:
+            logger.info(f"[GEN] SKIP | cooldown_active left~{int(COOLDOWN_SECONDS - elapsed)}s")
+        return False
 
-    def fetch_order(self, order_id: str, symbol: str) -> Dict[str, Any]:
-        return self.exchange.fetch_order(str(order_id), symbol)
+    sig = generate_signal()
+    if not sig:
+        return False
 
-    def cancel_order(self, order_id: str, symbol: str) -> Dict[str, Any]:
-        return self.exchange.cancel_order(str(order_id), symbol)
+    symbol = (sig.get("execution") or {}).get("symbol")
+    direction = (sig.get("execution") or {}).get("direction")
+    signature = (str(symbol), str(direction))
 
-    def place_market_buy_by_quote(self, symbol: str, quote_amount: float) -> Dict[str, Any]:
-        self._guard(symbol, quote_amount=quote_amount)
-        try:
-            params = {"quoteOrderQty": float(quote_amount)}
-            return self.exchange.create_order(symbol, "market", "buy", None, None, params)
-        except Exception as e:
-            raise ExchangeClientError(f"Market buy failed: {e}")
+    if _last_signature == signature:
+        _last_emit_ts = now
+        if GEN_DEBUG:
+            logger.info(f"[GEN] SKIP | dedupe_hit signature={signature}")
+        return False
 
-    def place_limit_sell_amount(self, symbol: str, base_amount: float, price: float) -> Dict[str, Any]:
-        self._guard(symbol)
-        try:
-            amt = float(self.exchange.amount_to_precision(symbol, base_amount))
-            px = float(self.exchange.price_to_precision(symbol, price))
-            return self.exchange.create_order(symbol, "limit", "sell", float(amt), float(px))
-        except Exception as e:
-            raise ExchangeClientError(f"Limit sell failed: {e}")
-
-    def place_stop_loss_limit_sell(self, symbol: str, base_amount: float, stop_price: float, limit_price: float) -> Dict[str, Any]:
-        """
-        Binance SPOT Stop-Loss-Limit order.
-        """
-        self._guard(symbol)
-        try:
-            amt = float(self.exchange.amount_to_precision(symbol, base_amount))
-            stop_px = float(self.exchange.price_to_precision(symbol, stop_price))
-            limit_px = float(self.exchange.price_to_precision(symbol, limit_price))
-
-            params = {
-                "stopPrice": stop_px,
-                "timeInForce": "GTC",
-            }
-            # Binance specific order type supported by ccxt for binance spot:
-            return self.exchange.create_order(symbol, "STOP_LOSS_LIMIT", "sell", float(amt), float(limit_px), params)
-        except Exception as e:
-            raise ExchangeClientError(f"Stop-loss-limit sell failed: {e}")
+    try:
+        append_signal(sig, outbox_path)
+        _last_emit_ts = now
+        _last_signature = signature
+        if GEN_DEBUG:
+            logger.info(f"[GEN] OUTBOX_APPEND_OK | path={outbox_path} id={sig.get('signal_id')} signature={signature}")
+        return True
+    except Exception as e:
+        logger.exception(f"[GEN] OUTBOX_APPEND_FAIL | path={outbox_path} err={e}")
+        return False
