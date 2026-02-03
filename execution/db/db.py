@@ -1,12 +1,11 @@
 # execution/db/db.py
 import sqlite3
+from pathlib import Path
 from execution.config import DB_PATH
 
 def get_connection():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row  # ✅ critical: dict-like rows
-    return conn
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
 
 def init_db():
     conn = get_connection()
@@ -48,10 +47,28 @@ def init_db():
     )
     """)
 
-    # ensure row exists
     cur.execute("""
     INSERT OR IGNORE INTO system_state (id, status, startup_sync_ok, kill_switch, updated_at)
     VALUES (1, 'RUNNING', 0, 0, datetime('now'))
+    """)
+
+    # ✅ OCO links (synthetic OCO: TP + SL orders)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS oco_links (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        signal_id TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        base_asset TEXT NOT NULL,
+        tp_order_id TEXT NOT NULL,
+        sl_order_id TEXT NOT NULL,
+        tp_price REAL NOT NULL,
+        sl_stop_price REAL NOT NULL,
+        sl_limit_price REAL NOT NULL,
+        amount REAL NOT NULL,
+        status TEXT NOT NULL,              -- ACTIVE / CLOSED / FAILED
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
     """)
 
     conn.commit()
