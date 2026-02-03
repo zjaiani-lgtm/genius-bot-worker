@@ -24,8 +24,8 @@ CONFIDENCE = float(os.getenv("BOT_SIGNAL_CONFIDENCE", "0.55"))
 GEN_DEBUG = os.getenv("GEN_DEBUG", "true").lower() == "true"
 GEN_LOG_EVERY_TICK = os.getenv("GEN_LOG_EVERY_TICK", "true").lower() == "true"
 
-# IMPORTANT: allow repeated signals only when NO active position/OCO exists
-DEDUPE_ONLY_WHEN_ACTIVE_OCO = os.getenv("DEDUPE_ONLY_WHEN_ACTIVE_OCO", "true").lower() == "true"
+# If there is an ACTIVE OCO -> do not create any new signals (avoid double-buy)
+BLOCK_SIGNALS_WHEN_ACTIVE_OCO = os.getenv("BLOCK_SIGNALS_WHEN_ACTIVE_OCO", "true").lower() == "true"
 
 _last_emit_ts: float = 0.0
 _last_signature: Optional[Tuple[str, str]] = None
@@ -38,15 +38,11 @@ def _now_utc_iso() -> str:
 
 
 def _has_active_oco() -> bool:
-    """
-    If we have ACTIVE OCO link in DB => position is considered "open/armed".
-    Then we should not allow repeating LONG signals (avoid double-buy).
-    """
     try:
         rows = list_active_oco_links(limit=1)
         return len(rows) > 0
     except Exception as e:
-        # fail-open: if DB read fails, be conservative and assume we DO have active OCO
+        # be conservative: if DB read fails, assume we have an active position
         logger.warning(f"[GEN] ACTIVE_OCO_CHECK_FAIL | err={e} -> assume active_oco=True")
         return True
 
@@ -123,18 +119,19 @@ def run_once(outbox_path: str) -> bool:
     global _last_emit_ts, _last_signature
 
     now = time.time()
-
-    # ✅ If there is NO active OCO, we can allow a new signal even if signature matches
     active_oco = _has_active_oco()
 
-    # Cooldown is primarily to avoid spam; but if you want "immediate re-entry after close",
-    # keep cooldown but only enforce it when active_oco is True.
-    if active_oco:
-        elapsed = now - _last_emit_ts
-        if elapsed < COOLDOWN_SECONDS:
-            if GEN_DEBUG:
-                logger.info(f"[GEN] SKIP | cooldown_active left~{int(COOLDOWN_SECONDS - elapsed)}s (active_oco=True)")
-            return False
+    # ✅ hard block while position/OCO exists
+    if BLOCK_SIGNALS_WHEN_ACTIVE_OCO and active_oco:
+        if GEN_DEBUG:
+            logger.info("[GEN] SKIP | active_oco=True -> block new signals")
+        return False
+
+    elapsed = now - _last_emit_ts
+    if elapsed < COOLDOWN_SECONDS:
+        if GEN_DEBUG:
+            logger.info(f"[GEN] SKIP | cooldown_active left~{int(COOLDOWN_SECONDS - elapsed)}s")
+        return False
 
     sig = generate_signal()
     if not sig:
@@ -144,11 +141,11 @@ def run_once(outbox_path: str) -> bool:
     direction = (sig.get("execution") or {}).get("direction")
     signature = (str(symbol), str(direction))
 
-    # ✅ Dedupe only when we have an active position/OCO
-    if DEDUPE_ONLY_WHEN_ACTIVE_OCO and active_oco and _last_signature == signature:
+    # basic dedupe (now safe because we already blocked active_oco)
+    if _last_signature == signature:
         _last_emit_ts = now
         if GEN_DEBUG:
-            logger.info(f"[GEN] SKIP | dedupe_hit signature={signature} (active_oco=True)")
+            logger.info(f"[GEN] SKIP | dedupe_hit signature={signature}")
         return False
 
     try:
@@ -156,10 +153,7 @@ def run_once(outbox_path: str) -> bool:
         _last_emit_ts = now
         _last_signature = signature
         if GEN_DEBUG:
-            logger.info(
-                f"[GEN] OUTBOX_APPEND_OK | path={outbox_path} id={sig.get('signal_id')} "
-                f"signature={signature} active_oco={active_oco}"
-            )
+            logger.info(f"[GEN] OUTBOX_APPEND_OK | path={outbox_path} id={sig.get('signal_id')} signature={signature}")
         return True
     except Exception as e:
         logger.exception(f"[GEN] OUTBOX_APPEND_FAIL | path={outbox_path} err={e}")
