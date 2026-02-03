@@ -2,61 +2,59 @@
 import os
 import time
 import logging
-from pathlib import Path
 
+from execution.db.db import init_db
 from execution.execution_engine import ExecutionEngine
-from execution.signal_client import ensure_signal_outbox_exists, pop_next_signal
+from execution.signal_client import pop_next_signal
 from execution.signal_generator import run_once as generate_once
 
 logger = logging.getLogger("gbm")
-logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(asctime)s - %(message)s")
-
-SIGNAL_OUTBOX_PATH = os.getenv("SIGNAL_OUTBOX_PATH", "/var/data/signal_outbox.json")
-POLL_SECONDS = int(os.getenv("SIGNAL_POLL_SECONDS", "10"))
 
 
-def run_worker() -> None:
+def main():
+    logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(asctime)s - %(message)s')
+
     mode = os.getenv("MODE", "DEMO").upper()
-    kill_switch = os.getenv("KILL_SWITCH", "false").lower() == "true"
-    live_confirmation = os.getenv("LIVE_CONFIRMATION", "false").lower() == "true"
+    outbox_path = os.getenv("SIGNAL_OUTBOX_PATH", "/var/data/signal_outbox.json")
+
+    init_db()
+    engine = ExecutionEngine()
+
+    # Optional: startup sync already handled by your startup_sync.py in previous steps
+    try:
+        engine.reconcile_oco()  # quick start
+    except Exception:
+        pass
 
     logger.info(f"GENIUS BOT MAN worker starting | MODE={mode}")
-    logger.info(f"KILL_SWITCH={'ON' if kill_switch else 'OFF'} | LIVE_CONFIRMATION={'ON' if live_confirmation else 'OFF'}")
-
-    ensure_signal_outbox_exists(SIGNAL_OUTBOX_PATH)
-
-    # Debug: show where we read/write outbox
-    p = Path(SIGNAL_OUTBOX_PATH)
-    logger.info(f"OUTBOX_PATH={SIGNAL_OUTBOX_PATH} exists={p.exists()} dir={p.parent}")
-
-    engine = ExecutionEngine()
-    engine.startup_sync()
+    logger.info(f"OUTBOX_PATH={outbox_path}")
 
     while True:
-        # 🧠 Brain: try to generate a signal (safe)
         try:
-            created = generate_once(SIGNAL_OUTBOX_PATH)
+            # ✅ reconcile synthetic OCO (cancel opposite if one filled)
+            try:
+                engine.reconcile_oco()
+            except Exception as e:
+                logger.warning(f"OCO_RECONCILE_LOOP_WARN | err={e}")
+
+            # 1) generate signal
+            created = generate_once(outbox_path)
             if created:
                 logger.info("SIGNAL_GENERATOR | signal created")
+
+            # 2) pop signal
+            sig = pop_next_signal(outbox_path)
+            if sig:
+                logger.info(f"Signal received | id={sig.get('signal_id')} | verdict={sig.get('final_verdict')}")
+                engine.execute_signal(sig)
+            else:
+                logger.info("Worker alive, waiting for SIGNAL_OUTBOX...")
+
         except Exception as e:
-            logger.exception(f"SIGNAL_GENERATOR ERROR | {e}")
+            logger.exception(f"WORKER_LOOP_ERROR | err={e}")
 
-        # 📥 Hands: pop next signal FIFO (and remove it)
-        sig = pop_next_signal(SIGNAL_OUTBOX_PATH)
-        if not sig:
-            logger.info("Worker alive, waiting for SIGNAL_OUTBOX...")
-            time.sleep(POLL_SECONDS)
-            continue
-
-        signal_id = str(sig.get("signal_id", "UNKNOWN"))
-        verdict = str(sig.get("final_verdict", "UNKNOWN"))
-        logger.info(f"Signal received | id={signal_id} | verdict={verdict}")
-
-        try:
-            engine.execute_signal(sig)
-        except Exception as e:
-            logger.exception(f"EXECUTION ERROR | id={signal_id} err={e}")
+        time.sleep(10)
 
 
 if __name__ == "__main__":
-    run_worker()
+    main()
