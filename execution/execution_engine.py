@@ -1,14 +1,16 @@
 # execution/execution_engine.py
 import os
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, Optional, Tuple
 
 import ccxt
 
 from execution.db.repository import (
     get_system_state,
-    update_system_state,
     log_event,
+    list_active_oco_links,
+    create_oco_link,
+    set_oco_status,
 )
 from execution.db.db import get_connection
 
@@ -39,13 +41,26 @@ def _to_bool01(v: Any) -> bool:
 
 
 def _floor_to_step(value: float, step: float) -> float:
-    """
-    Floors value to a given step (e.g. 0.000001).
-    """
     if step <= 0:
         return float(value)
     n = int(value / step)
     return float(n * step)
+
+
+def _get_lot_step(exchange: ccxt.Exchange, symbol: str) -> float:
+    """
+    Binance real amount stepSize from LOT_SIZE filter.
+    """
+    m = exchange.market(symbol)
+    filters = (m.get("info") or {}).get("filters", []) or []
+    for f in filters:
+        if f.get("filterType") == "LOT_SIZE":
+            step = float(f.get("stepSize") or 0.0)
+            if step > 0:
+                return step
+    # fallback
+    prec = int((m.get("precision", {}) or {}).get("amount", 8))
+    return 10 ** (-prec)
 
 
 class ExecutionEngine:
@@ -63,130 +78,132 @@ class ExecutionEngine:
 
         self.state_debug = os.getenv("STATE_DEBUG", "false").lower() == "true"
 
-        # Place LIMIT sell after BUY so you can see OPEN ORDER on Binance
-        self.tp_pct = float(os.getenv("TP_PCT", "0.30"))  # 0.30%
+        self.tp_pct = float(os.getenv("TP_PCT", "0.30"))
+        self.sl_pct = float(os.getenv("SL_PCT", "1.00"))
+        self.sl_limit_gap_pct = float(os.getenv("SL_LIMIT_GAP_PCT", "0.10"))
 
-        # Sell sizing safety
-        self.sell_buffer = float(os.getenv("SELL_BUFFER", "0.999"))  # keep tiny dust to avoid insufficient
-        self.sell_retry_buffer = float(os.getenv("SELL_RETRY_BUFFER", "0.995"))  # if first sell fails
+        self.sell_buffer = float(os.getenv("SELL_BUFFER", "0.999"))
+        self.sell_retry_buffer = float(os.getenv("SELL_RETRY_BUFFER", "0.995"))
 
     def _load_system_state(self) -> Dict[str, Any]:
         raw = get_system_state()
         if self.state_debug:
             logger.info(f"SYSTEM_STATE_RAW | type={type(raw)} value={raw}")
 
-        if isinstance(raw, dict):
-            return {
-                "status": str(raw.get("status") or "").upper(),
-                "kill_switch": _to_bool01(raw.get("kill_switch")),
-                "startup_sync_ok": _to_bool01(raw.get("startup_sync_ok")),
-            }
-
-        # fallback tuple order: (id, status, startup_sync_ok, kill_switch, updated_at)
+        # tuple: (id, status, startup_sync_ok, kill_switch, updated_at)
         if isinstance(raw, (list, tuple)):
             status = raw[1] if len(raw) > 1 else ""
             sync = raw[2] if len(raw) > 2 else 0
             kill = raw[3] if len(raw) > 3 else 0
             return {
                 "status": str(status or "").upper(),
-                "kill_switch": _to_bool01(kill),
                 "startup_sync_ok": _to_bool01(sync),
+                "kill_switch": _to_bool01(kill),
             }
 
-        return {"status": "", "kill_switch": False, "startup_sync_ok": False}
+        if isinstance(raw, dict):
+            return {
+                "status": str(raw.get("status") or "").upper(),
+                "startup_sync_ok": _to_bool01(raw.get("startup_sync_ok")),
+                "kill_switch": _to_bool01(raw.get("kill_switch")),
+            }
 
-    def _audit_has_signal(self, signal_id: str) -> bool:
-        if not signal_id:
-            return False
-        try:
-            conn = get_connection()
-            cur = conn.cursor()
-            cur.execute(
-                """
-                SELECT 1
-                FROM audit_log
-                WHERE event_type IN ('SIGNAL_SEEN', 'TRADE_EXECUTED', 'SIGNAL_PROCESSED')
-                  AND message LIKE ?
-                LIMIT 1
-                """,
-                (f"{signal_id}%",),
-            )
-            row = cur.fetchone()
-            conn.close()
-            return row is not None
-        except Exception as e:
-            logger.warning(f"IDEMPOTENCY_CHECK_FAILED -> BLOCK | id={signal_id} err={e}")
-            return True
-
-    def startup_sync(self) -> None:
-        from execution.startup_sync import run_startup_sync
-        ok = run_startup_sync()
-        if ok:
-            logger.info("STARTUP_SYNC: OK")
-        else:
-            logger.warning("STARTUP_SYNC: FAILED -> system PAUSED (NO TRADE)")
+        return {"status": "", "startup_sync_ok": False, "kill_switch": False}
 
     def _get_last_price(self, symbol: str) -> float:
         t = self.price_feed.fetch_ticker(symbol)
         return float(t["last"])
 
+    # ----------------------------
+    # OCO reconcile (synthetic)
+    # ----------------------------
+    def reconcile_oco(self) -> None:
+        if self.mode not in ("LIVE", "TESTNET"):
+            return
+        if self.exchange is None:
+            return
+
+        rows = list_active_oco_links(limit=50)
+        if not rows:
+            return
+
+        for r in rows:
+            (
+                link_id, signal_id, symbol, base_asset,
+                tp_order_id, sl_order_id,
+                tp_price, sl_stop_price, sl_limit_price,
+                amount, status, created_at, updated_at
+            ) = r
+
+            try:
+                tp = self.exchange.fetch_order(tp_order_id, symbol)
+                sl = self.exchange.fetch_order(sl_order_id, symbol)
+
+                tp_status = str(tp.get("status") or "").lower()
+                sl_status = str(sl.get("status") or "").lower()
+
+                # If TP filled -> cancel SL
+                if tp_status in ("closed", "filled"):
+                    try:
+                        self.exchange.cancel_order(sl_order_id, symbol)
+                        logger.info(f"OCO_RESOLVE | TP_FILLED -> cancel SL | link={link_id} tp={tp_order_id} sl={sl_order_id}")
+                    except Exception as e:
+                        logger.warning(f"OCO_RESOLVE_WARN | TP_FILLED cancel SL failed | link={link_id} err={e}")
+                    set_oco_status(link_id, "CLOSED")
+                    log_event("OCO_CLOSED", f"{signal_id} TP_FILLED tp={tp_order_id} sl={sl_order_id}")
+                    continue
+
+                # If SL filled -> cancel TP
+                if sl_status in ("closed", "filled"):
+                    try:
+                        self.exchange.cancel_order(tp_order_id, symbol)
+                        logger.info(f"OCO_RESOLVE | SL_FILLED -> cancel TP | link={link_id} tp={tp_order_id} sl={sl_order_id}")
+                    except Exception as e:
+                        logger.warning(f"OCO_RESOLVE_WARN | SL_FILLED cancel TP failed | link={link_id} err={e}")
+                    set_oco_status(link_id, "CLOSED")
+                    log_event("OCO_CLOSED", f"{signal_id} SL_FILLED tp={tp_order_id} sl={sl_order_id}")
+                    continue
+
+                # If one cancelled and other still open -> keep ACTIVE (or you can mark FAILED)
+                # We'll keep it ACTIVE and let it run.
+
+            except Exception as e:
+                logger.warning(f"OCO_RECONCILE_FAIL | link={link_id} symbol={symbol} err={e}")
+
+    # ----------------------------
+    # Main execution
+    # ----------------------------
     def execute_signal(self, signal: Dict[str, Any]) -> None:
         signal_id = str(signal.get("signal_id", "UNKNOWN"))
         verdict = str(signal.get("final_verdict", "")).upper()
 
         logger.info(f"EXEC_ENTER | id={signal_id} verdict={verdict} MODE={self.mode} ENV_KILL_SWITCH={self.env_kill_switch}")
 
-        if verdict not in ("TRADE", "CLOSE", "NO_TRADE"):
-            logger.warning(f"EXEC_REJECT | unknown verdict={verdict} | id={signal_id}")
-            return
-
-        if verdict == "NO_TRADE":
-            log_event("NO_TRADE", f"{signal_id} verdict=NO_TRADE")
-            return
-
-        # 1) contract gates
-        if signal.get("certified_signal") is not True:
-            log_event("REJECT_NOT_CERTIFIED", f"{signal_id} certified_signal=false")
-            return
-
-        mode_allowed = signal.get("mode_allowed") or {}
-        if self.mode == "DEMO" and not bool(mode_allowed.get("demo", False)):
-            log_event("REJECT_MODE_NOT_ALLOWED", f"{signal_id} mode=DEMO")
-            return
-        if self.mode in ("LIVE", "TESTNET") and not bool(mode_allowed.get("live", False)):
-            log_event("REJECT_MODE_NOT_ALLOWED", f"{signal_id} mode={self.mode}")
-            return
-
-        # 2) system gates
+        # gates
         state = self._load_system_state()
         db_status = str(state.get("status") or "").upper()
-        db_kill_switch = bool(state.get("kill_switch"))
-        startup_sync_ok = bool(state.get("startup_sync_ok"))
+        db_kill = bool(state.get("kill_switch"))
+        sync_ok = bool(state.get("startup_sync_ok"))
 
-        if self.env_kill_switch or db_kill_switch:
+        if self.env_kill_switch or db_kill:
             logger.warning(f"EXEC_BLOCKED | KILL_SWITCH=ON | id={signal_id}")
-            log_event("EXEC_BLOCKED_KILL_SWITCH", f"{signal_id} env={self.env_kill_switch} db={db_kill_switch}")
+            log_event("EXEC_BLOCKED_KILL_SWITCH", f"{signal_id}")
             return
 
-        if not startup_sync_ok or db_status not in ("ACTIVE", "RUNNING"):
-            logger.warning(f"EXEC_BLOCKED | system not ACTIVE/synced | id={signal_id} status={db_status} startup_sync_ok={startup_sync_ok}")
-            log_event("EXEC_BLOCKED_SYSTEM_STATE", f"{signal_id} status={db_status} startup_sync_ok={startup_sync_ok}")
+        if not sync_ok or db_status not in ("ACTIVE", "RUNNING"):
+            logger.warning(f"EXEC_BLOCKED | system not ACTIVE/synced | id={signal_id} status={db_status} sync_ok={sync_ok}")
+            log_event("EXEC_BLOCKED_SYSTEM_STATE", f"{signal_id} status={db_status} sync_ok={sync_ok}")
             return
 
         if self.mode == "LIVE" and not self.live_confirmation:
             logger.warning(f"EXEC_BLOCKED | LIVE_CONFIRMATION=OFF | id={signal_id}")
-            log_event("EXEC_BLOCKED_LIVE_CONFIRMATION", f"{signal_id} live_confirmation=false")
+            log_event("EXEC_BLOCKED_LIVE_CONFIRMATION", f"{signal_id}")
             return
 
-        # 3) idempotency
-        if self._audit_has_signal(signal_id):
-            logger.warning(f"DUPLICATE_SIGNAL_BLOCKED | id={signal_id}")
-            log_event("DUPLICATE_SIGNAL_BLOCKED", f"{signal_id} duplicate")
+        if signal.get("certified_signal") is not True:
+            log_event("REJECT_NOT_CERTIFIED", f"{signal_id}")
             return
 
-        log_event("SIGNAL_SEEN", f"{signal_id} verdict={verdict} mode={self.mode}")
-
-        # 4) parse payload
         execution = signal.get("execution") or {}
         symbol = execution.get("symbol")
         direction = str(execution.get("direction", "")).upper()
@@ -196,103 +213,111 @@ class ExecutionEngine:
         position_size = execution.get("position_size")
         quote_amount = execution.get("quote_amount")
 
-        if not symbol:
-            log_event("REJECT_BAD_PAYLOAD", f"{signal_id} missing symbol")
+        if not symbol or direction != "LONG" or entry_type != "MARKET":
+            logger.warning(f"EXEC_REJECT | bad payload | id={signal_id} symbol={symbol} dir={direction} entry={entry_type}")
+            log_event("REJECT_BAD_PAYLOAD", f"{signal_id}")
             return
 
-        # Spot: allow only LONG (buy -> sell)
-        if direction != "LONG":
-            logger.warning(f"EXEC_REJECT | unsupported direction for SPOT={direction} | id={signal_id}")
-            log_event("REJECT_BAD_PAYLOAD", f"{signal_id} unsupported direction={direction}")
-            return
-
-        if entry_type != "MARKET":
-            log_event("REJECT_BAD_PAYLOAD", f"{signal_id} unsupported entry={entry_type}")
-            return
-
-        if quote_amount is None and position_size is None:
-            log_event("REJECT_BAD_PAYLOAD", f"{signal_id} missing quote_amount/position_size")
-            return
-
-        # 5) execute
+        # DEMO
         if self.mode == "DEMO":
-            try:
-                last_price = self._get_last_price(symbol)
-                base_size = float(position_size) if position_size is not None else float(quote_amount) / float(last_price)
-                resp = simulate_market_entry(symbol=symbol, side=direction, size=base_size, price=last_price)
-                bal = get_balance()
-                logger.info(f"EXEC_DEMO_OK | id={signal_id} resp={resp} wallet_balance={bal}")
-                log_event("TRADE_EXECUTED", f"{signal_id} DEMO {symbol} {direction} size={base_size} price={last_price}")
-                return
-            except Exception as e:
-                logger.exception(f"EXEC_DEMO_ERROR | id={signal_id} err={e}")
-                log_event("EXEC_DEMO_ERROR", f"{signal_id} err={e}")
-                return
+            last_price = self._get_last_price(symbol)
+            base_size = float(position_size) if position_size is not None else float(quote_amount) / float(last_price)
+            resp = simulate_market_entry(symbol=symbol, side=direction, size=base_size, price=last_price)
+            log_event("TRADE_EXECUTED", f"{signal_id} DEMO {symbol} size={base_size} price={last_price}")
+            logger.info(f"EXEC_DEMO_OK | id={signal_id} resp={resp}")
+            return
 
         # LIVE/TESTNET
         if self.exchange is None:
+            log_event("EXEC_BLOCKED_NO_EXCHANGE", f"{signal_id}")
             logger.warning(f"EXEC_BLOCKED | exchange client not wired | id={signal_id}")
-            log_event("EXEC_BLOCKED_NO_EXCHANGE", f"{signal_id} exchange=None")
             return
 
         try:
-            # Compute quote_amount if absent
+            # compute quote
             if quote_amount is None:
                 last = self.exchange.fetch_last_price(symbol)
                 quote_amount = float(position_size) * float(last)
-
             quote_amount = float(quote_amount)
 
-            # 1) BUY market by quote
+            # BUY by quote
             buy = self.exchange.place_market_buy_by_quote(symbol=symbol, quote_amount=quote_amount)
-            logger.info(f"EXEC_LIVE_BUY_OK | id={signal_id} symbol={symbol} quote={quote_amount} resp={buy}")
-            log_event("TRADE_EXECUTED", f"{signal_id} {self.mode} BUY {symbol} quote={quote_amount}")
 
-            # 2) SELL LIMIT using FREE balance (fee-safe)
-            last_price = self.exchange.fetch_last_price(symbol)
-            tp_price = float(last_price) * (1.0 + (self.tp_pct / 100.0))
+            # derive buy price
+            buy_avg = float(buy.get("average") or buy.get("price") or 0.0) or self.exchange.fetch_last_price(symbol)
+
+            logger.info(f"EXEC_LIVE_BUY_OK | id={signal_id} symbol={symbol} quote={quote_amount} avg={buy_avg} order_id={buy.get('id')}")
+            log_event("TRADE_EXECUTED", f"{signal_id} LIVE BUY {symbol} quote={quote_amount} avg={buy_avg} order_id={buy.get('id')}")
 
             base_asset = symbol.split("/")[0].upper()
 
-            # fetch free balance (this accounts for fee & exact fill)
-            bal = self.exchange.exchange.fetch_balance()
-            free_base = float((bal.get("free", {}) or {}).get(base_asset, 0.0) or 0.0)
+            # free balance (fee-safe)
+            free_base = float(self.exchange.fetch_balance_free(base_asset))
 
-            # apply buffer to avoid insufficient due to rounding/fees
-            sell_amount_raw = free_base * float(self.sell_buffer)
+            # choose sell amount with buffer + lot step
+            step = _get_lot_step(self.exchange.exchange, symbol)
 
-            # floor to amount step (precision)
-            market = self.exchange.exchange.market(symbol)
-            step = 10 ** (-int(market.get("precision", {}).get("amount", 8)))
-            sell_amount = _floor_to_step(sell_amount_raw, step)
+            sell_amount = _floor_to_step(free_base * self.sell_buffer, step)
+            if sell_amount <= 0:
+                # retry with smaller buffer
+                sell_amount = _floor_to_step(free_base * self.sell_retry_buffer, step)
 
             if sell_amount <= 0:
-                raise Exception(f"SELL amount computed <= 0 | free_{base_asset}={free_base}")
+                raise Exception(f"SELL amount computed <= 0 | free_{base_asset}={free_base} step={step}")
 
-            # try place limit sell
+            # TP + SL prices
+            tp_price = buy_avg * (1.0 + (self.tp_pct / 100.0))
+            sl_stop_price = buy_avg * (1.0 - (self.sl_pct / 100.0))
+            # SL limit slightly below stop to get filled
+            sl_limit_price = sl_stop_price * (1.0 - (self.sl_limit_gap_pct / 100.0))
+
+            logger.info(
+                f"OCO_PREP | id={signal_id} free_{base_asset}={free_base} step={step} "
+                f"sell_amount={sell_amount} tp={tp_price} sl_stop={sl_stop_price} sl_limit={sl_limit_price}"
+            )
+
+            # Place TP LIMIT
+            tp = self.exchange.place_limit_sell_amount(symbol=symbol, base_amount=sell_amount, price=tp_price)
+            logger.info(f"OCO_TP_OK | id={signal_id} tp_order_id={tp.get('id')} price={tp_price} amount={sell_amount}")
+            log_event("ORDER_PLACED", f"{signal_id} TP_LIMIT {symbol} id={tp.get('id')} price={tp_price} amount={sell_amount}")
+
+            # Place SL STOP-LOSS-LIMIT
             try:
-                sell = self.exchange.place_limit_sell_amount(symbol=symbol, base_amount=sell_amount, price=tp_price)
-                logger.info(f"EXEC_LIVE_SELL_LIMIT_OK | id={signal_id} symbol={symbol} amount={sell_amount} tp_price={tp_price} resp={sell}")
-                log_event("ORDER_PLACED", f"{signal_id} {self.mode} SELL_LIMIT {symbol} amount={sell_amount} price={tp_price}")
-                return
+                sl = self.exchange.place_stop_loss_limit_sell(
+                    symbol=symbol,
+                    base_amount=sell_amount,
+                    stop_price=sl_stop_price,
+                    limit_price=sl_limit_price,
+                )
+                logger.info(f"OCO_SL_OK | id={signal_id} sl_order_id={sl.get('id')} stop={sl_stop_price} limit={sl_limit_price} amount={sell_amount}")
+                log_event("ORDER_PLACED", f"{signal_id} SL_STOP_LIMIT {symbol} id={sl.get('id')} stop={sl_stop_price} limit={sl_limit_price} amount={sell_amount}")
             except Exception as e:
-                # one retry with slightly smaller buffer
-                logger.warning(f"SELL_LIMIT_FAILED_FIRST | id={signal_id} err={e} -> retry smaller")
-                sell_amount_raw2 = free_base * float(self.sell_retry_buffer)
-                sell_amount2 = _floor_to_step(sell_amount_raw2, step)
+                # If SL fails, cancel TP for safety and surface error
+                logger.warning(f"OCO_SL_FAIL | id={signal_id} err={e} -> cancel TP")
+                try:
+                    self.exchange.cancel_order(tp.get("id"), symbol)
+                except Exception:
+                    pass
+                raise
 
-                if sell_amount2 <= 0:
-                    raise
+            # Save synthetic OCO link
+            create_oco_link(
+                signal_id=signal_id,
+                symbol=symbol,
+                base_asset=base_asset,
+                tp_order_id=str(tp.get("id")),
+                sl_order_id=str(sl.get("id")),
+                tp_price=float(tp_price),
+                sl_stop_price=float(sl_stop_price),
+                sl_limit_price=float(sl_limit_price),
+                amount=float(sell_amount),
+            )
 
-                sell2 = self.exchange.place_limit_sell_amount(symbol=symbol, base_amount=sell_amount2, price=tp_price)
-                logger.info(f"EXEC_LIVE_SELL_LIMIT_OK_RETRY | id={signal_id} symbol={symbol} amount={sell_amount2} tp_price={tp_price} resp={sell2}")
-                log_event("ORDER_PLACED", f"{signal_id} {self.mode} SELL_LIMIT_RETRY {symbol} amount={sell_amount2} price={tp_price}")
-                return
+            logger.info(f"OCO_ARMED | id={signal_id} symbol={symbol} tp={tp.get('id')} sl={sl.get('id')}")
+            log_event("OCO_ARMED", f"{signal_id} symbol={symbol} tp={tp.get('id')} sl={sl.get('id')} amount={sell_amount}")
 
         except Exception as e:
             logger.exception(f"EXEC_LIVE_ERROR | id={signal_id} err={e}")
-            # IMPORTANT: don't always PAUSE system for sell failure;
-            # but keeping your current behavior for safety
-            update_system_state(status="PAUSED", startup_sync_ok=False)
+            # ❗ LIVE-ზე ერთ შეცდომაზე ნუ ვპაუზავთ მთელ სისტემას — უბრალოდ დავალოგოთ
             log_event("EXEC_LIVE_ERROR", f"{signal_id} err={e}")
             return
