@@ -6,7 +6,9 @@ from datetime import datetime
 from typing import Optional, Dict, Any, Tuple
 
 import ccxt
+
 from execution.signal_client import append_signal
+from execution.db.repository import list_active_oco_links
 
 logger = logging.getLogger("gbm")
 
@@ -22,13 +24,32 @@ CONFIDENCE = float(os.getenv("BOT_SIGNAL_CONFIDENCE", "0.55"))
 GEN_DEBUG = os.getenv("GEN_DEBUG", "true").lower() == "true"
 GEN_LOG_EVERY_TICK = os.getenv("GEN_LOG_EVERY_TICK", "true").lower() == "true"
 
+# IMPORTANT: allow repeated signals only when NO active position/OCO exists
+DEDUPE_ONLY_WHEN_ACTIVE_OCO = os.getenv("DEDUPE_ONLY_WHEN_ACTIVE_OCO", "true").lower() == "true"
+
 _last_emit_ts: float = 0.0
 _last_signature: Optional[Tuple[str, str]] = None
 
 EXCHANGE = ccxt.binance({"enableRateLimit": True})
 
+
 def _now_utc_iso() -> str:
     return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
+def _has_active_oco() -> bool:
+    """
+    If we have ACTIVE OCO link in DB => position is considered "open/armed".
+    Then we should not allow repeating LONG signals (avoid double-buy).
+    """
+    try:
+        rows = list_active_oco_links(limit=1)
+        return len(rows) > 0
+    except Exception as e:
+        # fail-open: if DB read fails, be conservative and assume we DO have active OCO
+        logger.warning(f"[GEN] ACTIVE_OCO_CHECK_FAIL | err={e} -> assume active_oco=True")
+        return True
+
 
 def generate_signal() -> Optional[Dict[str, Any]]:
     try:
@@ -90,20 +111,30 @@ def generate_signal() -> Optional[Dict[str, Any]]:
     }
 
     if GEN_DEBUG:
-        logger.info(f"[GEN] SIGNAL_READY | id={signal_id} verdict=TRADE symbol={SYMBOL} dir=LONG mode_allowed={mode_allowed} pos_size={POSITION_SIZE}")
+        logger.info(
+            f"[GEN] SIGNAL_READY | id={signal_id} verdict=TRADE symbol={SYMBOL} dir=LONG "
+            f"mode_allowed={mode_allowed} pos_size={POSITION_SIZE}"
+        )
 
     return sig
+
 
 def run_once(outbox_path: str) -> bool:
     global _last_emit_ts, _last_signature
 
     now = time.time()
-    elapsed = now - _last_emit_ts
 
-    if elapsed < COOLDOWN_SECONDS:
-        if GEN_DEBUG:
-            logger.info(f"[GEN] SKIP | cooldown_active left~{int(COOLDOWN_SECONDS - elapsed)}s")
-        return False
+    # ✅ If there is NO active OCO, we can allow a new signal even if signature matches
+    active_oco = _has_active_oco()
+
+    # Cooldown is primarily to avoid spam; but if you want "immediate re-entry after close",
+    # keep cooldown but only enforce it when active_oco is True.
+    if active_oco:
+        elapsed = now - _last_emit_ts
+        if elapsed < COOLDOWN_SECONDS:
+            if GEN_DEBUG:
+                logger.info(f"[GEN] SKIP | cooldown_active left~{int(COOLDOWN_SECONDS - elapsed)}s (active_oco=True)")
+            return False
 
     sig = generate_signal()
     if not sig:
@@ -113,10 +144,11 @@ def run_once(outbox_path: str) -> bool:
     direction = (sig.get("execution") or {}).get("direction")
     signature = (str(symbol), str(direction))
 
-    if _last_signature == signature:
+    # ✅ Dedupe only when we have an active position/OCO
+    if DEDUPE_ONLY_WHEN_ACTIVE_OCO and active_oco and _last_signature == signature:
         _last_emit_ts = now
         if GEN_DEBUG:
-            logger.info(f"[GEN] SKIP | dedupe_hit signature={signature}")
+            logger.info(f"[GEN] SKIP | dedupe_hit signature={signature} (active_oco=True)")
         return False
 
     try:
@@ -124,7 +156,10 @@ def run_once(outbox_path: str) -> bool:
         _last_emit_ts = now
         _last_signature = signature
         if GEN_DEBUG:
-            logger.info(f"[GEN] OUTBOX_APPEND_OK | path={outbox_path} id={sig.get('signal_id')} signature={signature}")
+            logger.info(
+                f"[GEN] OUTBOX_APPEND_OK | path={outbox_path} id={sig.get('signal_id')} "
+                f"signature={signature} active_oco={active_oco}"
+            )
         return True
     except Exception as e:
         logger.exception(f"[GEN] OUTBOX_APPEND_FAIL | path={outbox_path} err={e}")
