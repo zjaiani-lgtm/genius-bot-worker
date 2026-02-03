@@ -3,9 +3,11 @@ import sqlite3
 from pathlib import Path
 from execution.config import DB_PATH
 
+
 def get_connection():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     return sqlite3.connect(DB_PATH, check_same_thread=False)
+
 
 def init_db():
     conn = get_connection()
@@ -65,7 +67,7 @@ def init_db():
         sl_stop_price REAL NOT NULL,
         sl_limit_price REAL NOT NULL,
         amount REAL NOT NULL,
-        status TEXT NOT NULL,              -- ACTIVE / CLOSED / FAILED
+        status TEXT NOT NULL,              -- ACTIVE / CLOSED_TP / CLOSED_SL / NEEDS_RETRY / FAILED
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
     )
