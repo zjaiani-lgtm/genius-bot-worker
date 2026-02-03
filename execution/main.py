@@ -4,11 +4,41 @@ import time
 import logging
 
 from execution.db.db import init_db
+from execution.db.repository import get_system_state, update_system_state
 from execution.execution_engine import ExecutionEngine
 from execution.signal_client import pop_next_signal
 from execution.signal_generator import run_once as generate_once
 
 logger = logging.getLogger("gbm")
+
+
+def _bootstrap_state_if_needed():
+    """
+    Prevent getting stuck after redeploys when DB is persisted on Render Disk.
+    If user intentionally paused via DB, keep KILL_SWITCH=true to enforce stop.
+    """
+    raw = get_system_state()
+    # tuple: (id, status, startup_sync_ok, kill_switch, updated_at)
+    if not isinstance(raw, (list, tuple)) or len(raw) < 5:
+        return
+
+    status = str(raw[1] or "").upper()
+    startup_sync_ok = int(raw[2] or 0)
+    kill_switch_db = int(raw[3] or 0)
+
+    env_kill = os.getenv("KILL_SWITCH", "false").lower() == "true"
+
+    logger.info(f"BOOTSTRAP_STATE | status={status} startup_sync_ok={startup_sync_ok} kill_db={kill_switch_db} env_kill={env_kill}")
+
+    # If kill switch is on (env or db), do not override anything
+    if env_kill or kill_switch_db == 1:
+        logger.warning("BOOTSTRAP_STATE | kill switch ON -> skip overrides")
+        return
+
+    # If stuck, self-heal to RUNNING + sync_ok=1
+    if status == "PAUSED" or startup_sync_ok == 0:
+        logger.warning("BOOTSTRAP_STATE | applying self-heal -> status=RUNNING startup_sync_ok=1")
+        update_system_state(status="RUNNING", startup_sync_ok=1, kill_switch=0)
 
 
 def main():
@@ -18,11 +48,13 @@ def main():
     outbox_path = os.getenv("SIGNAL_OUTBOX_PATH", "/var/data/signal_outbox.json")
 
     init_db()
+    _bootstrap_state_if_needed()
+
     engine = ExecutionEngine()
 
-    # Optional: startup sync already handled by your startup_sync.py in previous steps
+    # Optional: quick reconcile at start
     try:
-        engine.reconcile_oco()  # quick start
+        engine.reconcile_oco()
     except Exception:
         pass
 
@@ -31,7 +63,7 @@ def main():
 
     while True:
         try:
-            # ✅ reconcile synthetic OCO (cancel opposite if one filled)
+            # reconcile synthetic OCO
             try:
                 engine.reconcile_oco()
             except Exception as e:
