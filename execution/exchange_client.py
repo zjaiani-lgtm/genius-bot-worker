@@ -62,20 +62,11 @@ class BinanceSpotClient:
         if symbol and symbol.upper() not in self.symbol_whitelist:
             raise LiveTradingBlocked(f"Symbol not allowed by whitelist: {symbol}.")
         if quote_amount is not None and quote_amount > self.max_quote_per_trade:
-            raise LiveTradingBlocked(
-                f"quote_amount {quote_amount} exceeds MAX_QUOTE_PER_TRADE={self.max_quote_per_trade}"
-            )
+            raise LiveTradingBlocked(f"quote_amount {quote_amount} exceeds MAX_QUOTE_PER_TRADE={self.max_quote_per_trade}")
 
-    # ✅ ADD THIS (startup_sync uses it)
     def diagnostics(self) -> Dict[str, Any]:
-        """
-        Lightweight connectivity + permissions check (no trading).
-        Safe for LIVE: fetch balance & ticker.
-        """
         try:
-            # ensure credentials are usable (private endpoint)
             bal = self.exchange.fetch_balance()
-            # ensure public endpoint works
             sym = next(iter(self.symbol_whitelist)) if self.symbol_whitelist else "BTC/USDT"
             t = self.exchange.fetch_ticker(sym)
             return {
@@ -94,6 +85,16 @@ class BinanceSpotClient:
         t = self.exchange.fetch_ticker(symbol)
         return float(t["last"])
 
+    def fetch_balance_free(self, asset: str) -> float:
+        bal = self.exchange.fetch_balance()
+        return float((bal.get("free", {}) or {}).get(asset.upper(), 0.0) or 0.0)
+
+    def fetch_order(self, order_id: str, symbol: str) -> Dict[str, Any]:
+        return self.exchange.fetch_order(str(order_id), symbol)
+
+    def cancel_order(self, order_id: str, symbol: str) -> Dict[str, Any]:
+        return self.exchange.cancel_order(str(order_id), symbol)
+
     def place_market_buy_by_quote(self, symbol: str, quote_amount: float) -> Dict[str, Any]:
         self._guard(symbol, quote_amount=quote_amount)
         try:
@@ -110,3 +111,22 @@ class BinanceSpotClient:
             return self.exchange.create_order(symbol, "limit", "sell", float(amt), float(px))
         except Exception as e:
             raise ExchangeClientError(f"Limit sell failed: {e}")
+
+    def place_stop_loss_limit_sell(self, symbol: str, base_amount: float, stop_price: float, limit_price: float) -> Dict[str, Any]:
+        """
+        Binance SPOT Stop-Loss-Limit order.
+        """
+        self._guard(symbol)
+        try:
+            amt = float(self.exchange.amount_to_precision(symbol, base_amount))
+            stop_px = float(self.exchange.price_to_precision(symbol, stop_price))
+            limit_px = float(self.exchange.price_to_precision(symbol, limit_price))
+
+            params = {
+                "stopPrice": stop_px,
+                "timeInForce": "GTC",
+            }
+            # Binance specific order type supported by ccxt for binance spot:
+            return self.exchange.create_order(symbol, "STOP_LOSS_LIMIT", "sell", float(amt), float(limit_px), params)
+        except Exception as e:
+            raise ExchangeClientError(f"Stop-loss-limit sell failed: {e}")
