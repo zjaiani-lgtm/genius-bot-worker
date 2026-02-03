@@ -1,35 +1,16 @@
 # execution/db/repository.py
 from datetime import datetime
-from typing import Optional, Dict, Any
 from execution.db.db import get_connection
 
 # ---------------- SYSTEM STATE ----------------
 
-def get_system_state() -> Optional[Dict[str, Any]]:
+def get_system_state():
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("SELECT * FROM system_state WHERE id = 1")
     row = cur.fetchone()
     conn.close()
-
-    if row is None:
-        return None
-
-    # With row_factory=sqlite3.Row this becomes a dict cleanly
-    try:
-        return dict(row)
-    except Exception:
-        # Backward compatibility if row_factory not applied for some reason
-        # row might be a tuple: (id, status, startup_sync_ok, kill_switch, updated_at)
-        if isinstance(row, (list, tuple)):
-            return {
-                "id": row[0] if len(row) > 0 else 1,
-                "status": row[1] if len(row) > 1 else "RUNNING",
-                "startup_sync_ok": row[2] if len(row) > 2 else 0,
-                "kill_switch": row[3] if len(row) > 3 else 0,
-                "updated_at": row[4] if len(row) > 4 else None,
-            }
-        return None
+    return row
 
 def update_system_state(status=None, startup_sync_ok=None, kill_switch=None):
     conn = get_connection()
@@ -40,15 +21,15 @@ def update_system_state(status=None, startup_sync_ok=None, kill_switch=None):
 
     if status is not None:
         fields.append("status = ?")
-        values.append(str(status))
+        values.append(status)
 
     if startup_sync_ok is not None:
         fields.append("startup_sync_ok = ?")
-        values.append(1 if bool(startup_sync_ok) else 0)
+        values.append(int(startup_sync_ok))
 
     if kill_switch is not None:
         fields.append("kill_switch = ?")
-        values.append(1 if bool(kill_switch) else 0)
+        values.append(int(kill_switch))
 
     fields.append("updated_at = ?")
     values.append(datetime.utcnow().isoformat())
@@ -129,51 +110,61 @@ def log_event(event_type, message):
     conn.commit()
     conn.close()
 
-def has_executed_signal(signal_id: str) -> bool:
-    if not signal_id:
-        return False
+# ---------------- OCO LINKS ----------------
 
+def create_oco_link(
+    signal_id: str,
+    symbol: str,
+    base_asset: str,
+    tp_order_id: str,
+    sl_order_id: str,
+    tp_price: float,
+    sl_stop_price: float,
+    sl_limit_price: float,
+    amount: float,
+):
     conn = get_connection()
     cur = conn.cursor()
+    now = datetime.utcnow().isoformat()
     cur.execute(
         """
-        SELECT 1
-        FROM audit_log
-        WHERE event_type IN ('TRADE_EXECUTED_DEMO','POSITION_CLOSED_DEMO')
-          AND message LIKE ?
-        LIMIT 1
+        INSERT INTO oco_links
+        (signal_id, symbol, base_asset, tp_order_id, sl_order_id, tp_price, sl_stop_price, sl_limit_price, amount, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?)
         """,
-        (f"%id={signal_id}%",)
+        (
+            signal_id, symbol, base_asset,
+            str(tp_order_id), str(sl_order_id),
+            float(tp_price), float(sl_stop_price), float(sl_limit_price),
+            float(amount),
+            now, now
+        )
     )
-    row = cur.fetchone()
+    conn.commit()
     conn.close()
-    return row is not None
 
-# ---------------- INSPECT HELPERS ----------------
-
-def list_positions(limit: int = 20):
+def set_oco_status(link_id: int, status: str):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT id, symbol, side, size, entry_price, status, opened_at, closed_at, pnl
-        FROM positions
-        ORDER BY id DESC
-        LIMIT ?
+        UPDATE oco_links
+        SET status=?, updated_at=?
+        WHERE id=?
         """,
-        (int(limit),)
+        (status, datetime.utcnow().isoformat(), int(link_id))
     )
-    rows = cur.fetchall()
+    conn.commit()
     conn.close()
-    return rows
 
-def list_audit_log(limit: int = 30):
+def list_active_oco_links(limit: int = 50):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT id, event_type, message, created_at
-        FROM audit_log
+        SELECT id, signal_id, symbol, base_asset, tp_order_id, sl_order_id, tp_price, sl_stop_price, sl_limit_price, amount, status, created_at, updated_at
+        FROM oco_links
+        WHERE status='ACTIVE'
         ORDER BY id DESC
         LIMIT ?
         """,
