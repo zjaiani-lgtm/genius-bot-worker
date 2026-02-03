@@ -1,8 +1,6 @@
-# execution/exchange_client.py
 import os
 import logging
 from typing import Any, Dict, Optional
-import math
 
 import ccxt
 
@@ -15,22 +13,6 @@ class ExchangeClientError(Exception):
 
 class LiveTradingBlocked(Exception):
     pass
-
-
-def _safe_float(x: Any, default: float = 0.0) -> float:
-    try:
-        return float(x)
-    except Exception:
-        return default
-
-
-def _floor_to_step(value: float, step: float) -> float:
-    value = float(value)
-    step = float(step)
-    if step <= 0:
-        return value
-    n = math.floor((value + 1e-12) / step)
-    return float(n * step)
 
 
 class BinanceSpotClient:
@@ -69,6 +51,7 @@ class BinanceSpotClient:
             }
             self.exchange.options["fetchCurrencies"] = False
 
+        # warm up markets for precision helpers
         try:
             self.exchange.load_markets()
         except Exception as e:
@@ -84,49 +67,25 @@ class BinanceSpotClient:
         if symbol and symbol.upper() not in self.symbol_whitelist:
             raise LiveTradingBlocked(f"Symbol not allowed by whitelist: {symbol}.")
         if quote_amount is not None and quote_amount > self.max_quote_per_trade:
-            raise LiveTradingBlocked(
-                f"quote_amount {quote_amount} exceeds MAX_QUOTE_PER_TRADE={self.max_quote_per_trade}"
-            )
+            raise LiveTradingBlocked(f"quote_amount {quote_amount} exceeds MAX_QUOTE_PER_TRADE={self.max_quote_per_trade}")
 
-    def _ensure_markets(self) -> None:
-        if not getattr(self.exchange, "markets", None):
-            self.exchange.load_markets()
+    def diagnostics(self) -> Dict[str, Any]:
+        try:
+            bal = self.exchange.fetch_balance()
+            sym = next(iter(self.symbol_whitelist)) if self.symbol_whitelist else "BTC/USDT"
+            t = self.exchange.fetch_ticker(sym)
+            return {
+                "mode": self.mode,
+                "kill_switch": self.kill_switch,
+                "live_confirmation": self.live_confirmation,
+                "symbol_probe": sym,
+                "last_price": float(t.get("last") or 0.0),
+                "usdt_free": float((bal.get("free", {}) or {}).get("USDT", 0.0) or 0.0),
+                "ok": True,
+            }
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
 
-    def get_lot_step_size(self, symbol: str) -> float:
-        self._ensure_markets()
-        m = self.exchange.market(symbol)
-        filters = (m.get("info") or {}).get("filters", []) or []
-        for f in filters:
-            if f.get("filterType") == "LOT_SIZE":
-                step = _safe_float(f.get("stepSize"), 0.0)
-                if step > 0:
-                    return step
-        prec = int((m.get("precision", {}) or {}).get("amount", 8))
-        return 10 ** (-prec)
-
-    def get_price_tick_size(self, symbol: str) -> float:
-        self._ensure_markets()
-        m = self.exchange.market(symbol)
-        filters = (m.get("info") or {}).get("filters", []) or []
-        for f in filters:
-            if f.get("filterType") == "PRICE_FILTER":
-                tick = _safe_float(f.get("tickSize"), 0.0)
-                if tick > 0:
-                    return tick
-        prec = int((m.get("precision", {}) or {}).get("price", 2))
-        return 10 ** (-prec)
-
-    def floor_amount(self, symbol: str, amount: float) -> float:
-        step = self.get_lot_step_size(symbol)
-        return _floor_to_step(float(amount), float(step))
-
-    def floor_price(self, symbol: str, price: float) -> float:
-        tick = self.get_price_tick_size(symbol)
-        return _floor_to_step(float(price), float(tick))
-
-    # -------------------------
-    # Basic calls
-    # -------------------------
     def fetch_last_price(self, symbol: str) -> float:
         t = self.exchange.fetch_ticker(symbol)
         return float(t["last"])
@@ -141,9 +100,38 @@ class BinanceSpotClient:
     def cancel_order(self, order_id: str, symbol: str) -> Dict[str, Any]:
         return self.exchange.cancel_order(str(order_id), symbol)
 
-    # -------------------------
-    # Trading
-    # -------------------------
+    # ----------------------------
+    # Precision helpers (STRING!)
+    # ----------------------------
+    def floor_amount(self, symbol: str, amount: float) -> float:
+        """
+        Returns float but derived from amount_to_precision (string) to avoid float artifacts.
+        """
+        try:
+            s = self.exchange.amount_to_precision(symbol, amount)  # string like "0.00018"
+            return float(s)
+        except Exception:
+            return float(amount)
+
+    def floor_price(self, symbol: str, price: float) -> float:
+        """
+        Returns float but derived from price_to_precision (string) to avoid float artifacts.
+        """
+        try:
+            s = self.exchange.price_to_precision(symbol, price)  # string like "76253.90"
+            return float(s)
+        except Exception:
+            return float(price)
+
+    def _amount_str(self, symbol: str, amount: float) -> str:
+        return str(self.exchange.amount_to_precision(symbol, amount))
+
+    def _price_str(self, symbol: str, price: float) -> str:
+        return str(self.exchange.price_to_precision(symbol, price))
+
+    # ----------------------------
+    # Orders
+    # ----------------------------
     def place_market_buy_by_quote(self, symbol: str, quote_amount: float) -> Dict[str, Any]:
         self._guard(symbol, quote_amount=quote_amount)
         try:
@@ -152,53 +140,50 @@ class BinanceSpotClient:
         except Exception as e:
             raise ExchangeClientError(f"Market buy failed: {e}")
 
-    def place_oco_sell(
-        self,
-        symbol: str,
-        base_amount: float,
-        tp_price: float,
-        sl_stop_price: float,
-        sl_limit_price: float,
-    ) -> Dict[str, Any]:
+    def place_limit_sell_amount(self, symbol: str, base_amount: float, price: float) -> Dict[str, Any]:
+        self._guard(symbol)
+        try:
+            amt = float(self.exchange.amount_to_precision(symbol, base_amount))
+            px = float(self.exchange.price_to_precision(symbol, price))
+            return self.exchange.create_order(symbol, "limit", "sell", float(amt), float(px))
+        except Exception as e:
+            raise ExchangeClientError(f"Limit sell failed: {e}")
+
+    def place_stop_loss_limit_sell(self, symbol: str, base_amount: float, stop_price: float, limit_price: float) -> Dict[str, Any]:
+        self._guard(symbol)
+        try:
+            amt = float(self.exchange.amount_to_precision(symbol, base_amount))
+            stop_px = float(self.exchange.price_to_precision(symbol, stop_price))
+            limit_px = float(self.exchange.price_to_precision(symbol, limit_price))
+            params = {"stopPrice": stop_px, "timeInForce": "GTC"}
+            return self.exchange.create_order(symbol, "STOP_LOSS_LIMIT", "sell", float(amt), float(limit_px), params)
+        except Exception as e:
+            raise ExchangeClientError(f"Stop-loss-limit sell failed: {e}")
+
+    def place_oco_sell(self, symbol: str, base_amount: float, tp_price: float, sl_stop_price: float, sl_limit_price: float) -> Dict[str, Any]:
         """
-        Native Binance OCO order (Spot): one request, one balance reserve.
-        Endpoint: POST /api/v3/order/oco
-        ccxt usually exposes it as privatePostOrderOco (or similar). We try safely.
+        Native Binance Spot OCO (single reserve).
+        IMPORTANT: use STRING precision to avoid -1111 price precision errors.
         """
         self._guard(symbol)
-
         try:
-            amt = self.floor_amount(symbol, base_amount)
-            tp_px = self.floor_price(symbol, tp_price)
-            stop_px = self.floor_price(symbol, sl_stop_price)
-            limit_px = self.floor_price(symbol, sl_limit_price)
+            qty = self._amount_str(symbol, base_amount)
+            price = self._price_str(symbol, tp_price)
+            stop_price = self._price_str(symbol, sl_stop_price)
+            stop_limit_price = self._price_str(symbol, sl_limit_price)
 
-            if amt <= 0:
-                raise ExchangeClientError(f"OCO amount <= 0 after floor | raw={base_amount}")
-            if tp_px <= 0 or stop_px <= 0 or limit_px <= 0:
-                raise ExchangeClientError("OCO prices invalid after floor")
-
-            # Binance expects "quantity" (base), "price"(TP), "stopPrice"(SL stop), "stopLimitPrice"(SL limit)
             payload = {
-                "symbol": self.exchange.market_id(symbol),  # e.g. BTCUSDT
+                "symbol": self.exchange.market_id(symbol),
                 "side": "SELL",
-                "quantity": amt,
-                "price": tp_px,
-                "stopPrice": stop_px,
-                "stopLimitPrice": limit_px,
+                "quantity": qty,
+                "price": price,
+                "stopPrice": stop_price,
+                "stopLimitPrice": stop_limit_price,
                 "stopLimitTimeInForce": "GTC",
             }
 
-            # Try ccxt raw methods (varies by version)
-            if hasattr(self.exchange, "privatePostOrderOco"):
-                res = self.exchange.privatePostOrderOco(payload)
-            elif hasattr(self.exchange, "private_post_order_oco"):
-                res = self.exchange.private_post_order_oco(payload)
-            else:
-                # last resort: try through describe / request not available -> fail loudly
-                raise ExchangeClientError("ccxt binance: OCO endpoint method not found (privatePostOrderOco).")
-
-            return {"ok": True, "raw": res, "amount": amt, "tp_price": tp_px, "sl_stop": stop_px, "sl_limit": limit_px}
-
+            # direct endpoint call (stable)
+            res = self.exchange.privatePostOrderOco(payload)
+            return {"raw": res}
         except Exception as e:
             raise ExchangeClientError(f"OCO sell failed: {e}")
