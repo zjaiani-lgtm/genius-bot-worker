@@ -1,7 +1,7 @@
 # execution/execution_engine.py
 import os
 import logging
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict
 
 import ccxt
 
@@ -12,12 +12,9 @@ from execution.db.repository import (
     create_oco_link,
     set_oco_status,
 )
-from execution.db.db import get_connection
 
 from execution.virtual_wallet import (
-    get_balance,
     simulate_market_entry,
-    simulate_market_close,
 )
 
 logger = logging.getLogger("gbm")
@@ -40,35 +37,13 @@ def _to_bool01(v: Any) -> bool:
     return False
 
 
-def _floor_to_step(value: float, step: float) -> float:
-    if step <= 0:
-        return float(value)
-    n = int(value / step)
-    return float(n * step)
-
-
-def _get_lot_step(exchange: ccxt.Exchange, symbol: str) -> float:
-    """
-    Binance real amount stepSize from LOT_SIZE filter.
-    """
-    m = exchange.market(symbol)
-    filters = (m.get("info") or {}).get("filters", []) or []
-    for f in filters:
-        if f.get("filterType") == "LOT_SIZE":
-            step = float(f.get("stepSize") or 0.0)
-            if step > 0:
-                return step
-    # fallback
-    prec = int((m.get("precision", {}) or {}).get("amount", 8))
-    return 10 ** (-prec)
-
-
 class ExecutionEngine:
     def __init__(self):
         self.mode = os.getenv("MODE", "DEMO").upper()  # DEMO | TESTNET | LIVE
         self.env_kill_switch = os.getenv("KILL_SWITCH", "false").lower() == "true"
         self.live_confirmation = os.getenv("LIVE_CONFIRMATION", "false").lower() == "true"
 
+        # price feed (public)
         self.price_feed = ccxt.binance({"enableRateLimit": True})
 
         self.exchange = None
@@ -142,6 +117,11 @@ class ExecutionEngine:
                 tp_status = str(tp.get("status") or "").lower()
                 sl_status = str(sl.get("status") or "").lower()
 
+                logger.info(
+                    f"OCO_RECONCILE | link={link_id} id={signal_id} symbol={symbol} "
+                    f"tp={tp_order_id}:{tp_status} sl={sl_order_id}:{sl_status}"
+                )
+
                 # If TP filled -> cancel SL
                 if tp_status in ("closed", "filled"):
                     try:
@@ -149,7 +129,7 @@ class ExecutionEngine:
                         logger.info(f"OCO_RESOLVE | TP_FILLED -> cancel SL | link={link_id} tp={tp_order_id} sl={sl_order_id}")
                     except Exception as e:
                         logger.warning(f"OCO_RESOLVE_WARN | TP_FILLED cancel SL failed | link={link_id} err={e}")
-                    set_oco_status(link_id, "CLOSED")
+                    set_oco_status(link_id, "CLOSED_TP")
                     log_event("OCO_CLOSED", f"{signal_id} TP_FILLED tp={tp_order_id} sl={sl_order_id}")
                     continue
 
@@ -160,12 +140,9 @@ class ExecutionEngine:
                         logger.info(f"OCO_RESOLVE | SL_FILLED -> cancel TP | link={link_id} tp={tp_order_id} sl={sl_order_id}")
                     except Exception as e:
                         logger.warning(f"OCO_RESOLVE_WARN | SL_FILLED cancel TP failed | link={link_id} err={e}")
-                    set_oco_status(link_id, "CLOSED")
+                    set_oco_status(link_id, "CLOSED_SL")
                     log_event("OCO_CLOSED", f"{signal_id} SL_FILLED tp={tp_order_id} sl={sl_order_id}")
                     continue
-
-                # If one cancelled and other still open -> keep ACTIVE (or you can mark FAILED)
-                # We'll keep it ACTIVE and let it run.
 
             except Exception as e:
                 logger.warning(f"OCO_RECONCILE_FAIL | link={link_id} symbol={symbol} err={e}")
@@ -233,8 +210,9 @@ class ExecutionEngine:
             logger.warning(f"EXEC_BLOCKED | exchange client not wired | id={signal_id}")
             return
 
+        # NOTE: LIVE-ზე შეცდომაზე ნუ ვპაუზავთ მთლიან სისტემას.
         try:
-            # compute quote
+            # compute quote if missing
             if quote_amount is None:
                 last = self.exchange.fetch_last_price(symbol)
                 quote_amount = float(position_size) * float(last)
@@ -246,7 +224,10 @@ class ExecutionEngine:
             # derive buy price
             buy_avg = float(buy.get("average") or buy.get("price") or 0.0) or self.exchange.fetch_last_price(symbol)
 
-            logger.info(f"EXEC_LIVE_BUY_OK | id={signal_id} symbol={symbol} quote={quote_amount} avg={buy_avg} order_id={buy.get('id')}")
+            logger.info(
+                f"EXEC_LIVE_BUY_OK | id={signal_id} symbol={symbol} quote={quote_amount} "
+                f"avg={buy_avg} order_id={buy.get('id')}"
+            )
             log_event("TRADE_EXECUTED", f"{signal_id} LIVE BUY {symbol} quote={quote_amount} avg={buy_avg} order_id={buy.get('id')}")
 
             base_asset = symbol.split("/")[0].upper()
@@ -254,25 +235,25 @@ class ExecutionEngine:
             # free balance (fee-safe)
             free_base = float(self.exchange.fetch_balance_free(base_asset))
 
-            # choose sell amount with buffer + lot step
-            step = _get_lot_step(self.exchange.exchange, symbol)
-
-            sell_amount = _floor_to_step(free_base * self.sell_buffer, step)
+            # choose sell amount with buffer (flooring happens inside exchange_client)
+            sell_amount = self.exchange.floor_amount(symbol, free_base * self.sell_buffer)
             if sell_amount <= 0:
-                # retry with smaller buffer
-                sell_amount = _floor_to_step(free_base * self.sell_retry_buffer, step)
+                sell_amount = self.exchange.floor_amount(symbol, free_base * self.sell_retry_buffer)
 
+            # If still <=0 → do NOT crash / do NOT pause. Just log and exit.
             if sell_amount <= 0:
-                raise Exception(f"SELL amount computed <= 0 | free_{base_asset}={free_base} step={step}")
+                msg = f"OCO_SKIP_NO_FREE_BASE | id={signal_id} free_{base_asset}={free_base}"
+                logger.warning(msg)
+                log_event("OCO_SKIP_NO_FREE_BASE", msg)
+                return
 
-            # TP + SL prices
-            tp_price = buy_avg * (1.0 + (self.tp_pct / 100.0))
-            sl_stop_price = buy_avg * (1.0 - (self.sl_pct / 100.0))
-            # SL limit slightly below stop to get filled
-            sl_limit_price = sl_stop_price * (1.0 - (self.sl_limit_gap_pct / 100.0))
+            # TP + SL prices (floor tickSize in exchange_client)
+            tp_price = self.exchange.floor_price(symbol, buy_avg * (1.0 + (self.tp_pct / 100.0)))
+            sl_stop_price = self.exchange.floor_price(symbol, buy_avg * (1.0 - (self.sl_pct / 100.0)))
+            sl_limit_price = self.exchange.floor_price(symbol, sl_stop_price * (1.0 - (self.sl_limit_gap_pct / 100.0)))
 
             logger.info(
-                f"OCO_PREP | id={signal_id} free_{base_asset}={free_base} step={step} "
+                f"OCO_PREP | id={signal_id} free_{base_asset}={free_base} "
                 f"sell_amount={sell_amount} tp={tp_price} sl_stop={sl_stop_price} sl_limit={sl_limit_price}"
             )
 
@@ -282,6 +263,7 @@ class ExecutionEngine:
             log_event("ORDER_PLACED", f"{signal_id} TP_LIMIT {symbol} id={tp.get('id')} price={tp_price} amount={sell_amount}")
 
             # Place SL STOP-LOSS-LIMIT
+            sl = None
             try:
                 sl = self.exchange.place_stop_loss_limit_sell(
                     symbol=symbol,
@@ -289,16 +271,23 @@ class ExecutionEngine:
                     stop_price=sl_stop_price,
                     limit_price=sl_limit_price,
                 )
-                logger.info(f"OCO_SL_OK | id={signal_id} sl_order_id={sl.get('id')} stop={sl_stop_price} limit={sl_limit_price} amount={sell_amount}")
+                logger.info(
+                    f"OCO_SL_OK | id={signal_id} sl_order_id={sl.get('id')} stop={sl_stop_price} "
+                    f"limit={sl_limit_price} amount={sell_amount}"
+                )
                 log_event("ORDER_PLACED", f"{signal_id} SL_STOP_LIMIT {symbol} id={sl.get('id')} stop={sl_stop_price} limit={sl_limit_price} amount={sell_amount}")
+
             except Exception as e:
-                # If SL fails, cancel TP for safety and surface error
+                # If SL fails, cancel TP for safety (avoid naked TP-only)
                 logger.warning(f"OCO_SL_FAIL | id={signal_id} err={e} -> cancel TP")
                 try:
                     self.exchange.cancel_order(tp.get("id"), symbol)
-                except Exception:
-                    pass
-                raise
+                except Exception as ee:
+                    logger.warning(f"OCO_SL_FAIL_CANCEL_TP_WARN | id={signal_id} err={ee}")
+
+                # Mark as NEEDS_RETRY in DB (optional: create link with missing sl? better: just log)
+                log_event("OCO_NEEDS_RETRY", f"{signal_id} SL_FAIL err={e}")
+                return
 
             # Save synthetic OCO link
             create_oco_link(
@@ -318,6 +307,5 @@ class ExecutionEngine:
 
         except Exception as e:
             logger.exception(f"EXEC_LIVE_ERROR | id={signal_id} err={e}")
-            # ❗ LIVE-ზე ერთ შეცდომაზე ნუ ვპაუზავთ მთელ სისტემას — უბრალოდ დავალოგოთ
             log_event("EXEC_LIVE_ERROR", f"{signal_id} err={e}")
             return
