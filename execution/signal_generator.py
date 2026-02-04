@@ -1,160 +1,157 @@
+# execution/signal_client.py
+import json
 import os
-import time
-import uuid
+import hashlib
 import logging
-from datetime import datetime
-from typing import Optional, Dict, Any, Tuple
-
-import ccxt
-
-from execution.signal_client import append_signal
-from execution.db.repository import list_active_oco_links
+from typing import Any, Dict, List, Optional
+from tempfile import NamedTemporaryFile
 
 logger = logging.getLogger("gbm")
 
-SYMBOL = os.getenv("BOT_SYMBOL", "BTC/USDT")
-TIMEFRAME = os.getenv("BOT_TIMEFRAME", "1m")
-CANDLE_LIMIT = int(os.getenv("BOT_CANDLE_LIMIT", "50"))
-COOLDOWN_SECONDS = int(os.getenv("BOT_SIGNAL_COOLDOWN_SECONDS", "60"))
-
-ALLOW_LIVE_SIGNALS = os.getenv("ALLOW_LIVE_SIGNALS", "false").lower() == "true"
-POSITION_SIZE = float(os.getenv("BOT_POSITION_SIZE", "0.0001"))
-CONFIDENCE = float(os.getenv("BOT_SIGNAL_CONFIDENCE", "0.55"))
-
-GEN_DEBUG = os.getenv("GEN_DEBUG", "true").lower() == "true"
-GEN_LOG_EVERY_TICK = os.getenv("GEN_LOG_EVERY_TICK", "true").lower() == "true"
-
-# If there is an ACTIVE OCO -> do not create any new signals (avoid double-buy)
-BLOCK_SIGNALS_WHEN_ACTIVE_OCO = os.getenv("BLOCK_SIGNALS_WHEN_ACTIVE_OCO", "true").lower() == "true"
-
-_last_emit_ts: float = 0.0
-_last_signature: Optional[Tuple[str, str]] = None
-
-EXCHANGE = ccxt.binance({"enableRateLimit": True})
+ALLOWED_ACTIONS = {"SELL", "BUY", "HOLD", "TRADE"}
+ALLOWED_SELL_MODES = {"EMERGENCY", "PARTIAL", "NORMAL"}
 
 
-def _now_utc_iso() -> str:
-    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
-
-
-def _has_active_oco() -> bool:
+def _safe_float(x: Any) -> Optional[float]:
     try:
-        rows = list_active_oco_links(limit=1)
-        return len(rows) > 0
-    except Exception as e:
-        # be conservative: if DB read fails, assume we have an active position
-        logger.warning(f"[GEN] ACTIVE_OCO_CHECK_FAIL | err={e} -> assume active_oco=True")
-        return True
-
-
-def generate_signal() -> Optional[Dict[str, Any]]:
-    try:
-        t0 = time.time()
-        ohlcv = EXCHANGE.fetch_ohlcv(SYMBOL, timeframe=TIMEFRAME, limit=CANDLE_LIMIT)
-        dt_ms = int((time.time() - t0) * 1000)
-        if GEN_DEBUG:
-            logger.info(f"[GEN] FETCH_OK | symbol={SYMBOL} tf={TIMEFRAME} candles={len(ohlcv) if ohlcv else 0} dt={dt_ms}ms")
-    except Exception as e:
-        logger.exception(f"[GEN] FETCH_FAIL | symbol={SYMBOL} tf={TIMEFRAME} err={e}")
+        if x is None:
+            return None
+        return float(x)
+    except Exception:
         return None
 
-    if not ohlcv or len(ohlcv) < 25:
-        if GEN_LOG_EVERY_TICK:
-            logger.info(f"[GEN] NO_SIGNAL | reason=not_enough_candles got={len(ohlcv) if ohlcv else 0} need>=25")
-        return None
 
-    closes = [c[4] for c in ohlcv]
-    last = float(closes[-1])
-    prev = float(closes[-2])
-    ma20 = float(sum(closes[-20:]) / 20.0)
+def _fingerprint(signal: Dict[str, Any]) -> str:
+    """
+    Stable fingerprint across restarts.
+    Prefer Excel decision keys if present; otherwise use execution payload.
+    """
+    action = str(signal.get("action") or "").upper().strip()
+    mode = str(signal.get("mode") or "").upper().strip()
+    pct = signal.get("pct")
 
-    cond_ma = last > ma20
-    cond_mom = last > prev
+    # Excel-style fingerprint
+    if action in ("SELL", "BUY", "HOLD"):
+        symbol = str(signal.get("symbol") or "").upper().strip()
+        pct_f = _safe_float(pct)
+        base = f"v2:{action}:{mode}:{pct_f}:{symbol}"
+        return hashlib.sha256(base.encode("utf-8")).hexdigest()
 
-    if GEN_LOG_EVERY_TICK:
-        logger.info(
-            f"[GEN] SNAPSHOT | last={last:.2f} prev={prev:.2f} ma20={ma20:.2f} "
-            f"cond(last>ma20)={cond_ma} cond(last>prev)={cond_mom}"
-        )
-
-    if not (cond_ma and cond_mom):
-        if GEN_LOG_EVERY_TICK:
-            reason = []
-            if not cond_ma:
-                reason.append("last<=ma20")
-            if not cond_mom:
-                reason.append("last<=prev")
-            logger.info(f"[GEN] NO_SIGNAL | reason={','.join(reason) if reason else 'unknown'}")
-        return None
-
-    mode_allowed = {"demo": True, "live": bool(ALLOW_LIVE_SIGNALS)}
-    signal_id = f"GBM-AUTO-{uuid.uuid4().hex}"
-
-    sig = {
-        "signal_id": signal_id,
-        "timestamp_utc": _now_utc_iso(),
-        "final_verdict": "TRADE",
-        "certified_signal": True,
-        "confidence": CONFIDENCE,
-        "mode_allowed": mode_allowed,
-        "execution": {
-            "symbol": SYMBOL,
-            "direction": "LONG",
-            "entry": {"type": "MARKET", "price": None},
-            "position_size": POSITION_SIZE,
-            "risk": {"stop_loss": None, "take_profit": None},
-        },
-    }
-
-    if GEN_DEBUG:
-        logger.info(
-            f"[GEN] SIGNAL_READY | id={signal_id} verdict=TRADE symbol={SYMBOL} dir=LONG "
-            f"mode_allowed={mode_allowed} pos_size={POSITION_SIZE}"
-        )
-
-    return sig
+    # Generator-style / trade payload
+    execution = signal.get("execution") or {}
+    symbol = str(execution.get("symbol") or "").upper().strip()
+    direction = str(execution.get("direction") or "").upper().strip()
+    entry = (execution.get("entry") or {}).get("type")
+    entry_type = str(entry or "").upper().strip()
+    pos_size = _safe_float(execution.get("position_size"))
+    # Use "TRADE" as action
+    base = f"v1:TRADE:{symbol}:{direction}:{entry_type}:{pos_size}"
+    return hashlib.sha256(base.encode("utf-8")).hexdigest()
 
 
-def run_once(outbox_path: str) -> bool:
-    global _last_emit_ts, _last_signature
+def validate_signal(signal: Dict[str, Any]) -> None:
+    """
+    Strict contract validation:
+    Supports:
+    - Excel decision schema: {action, mode, pct, symbol}
+    - Generator schema: {final_verdict, certified_signal, execution{...}}
+    """
+    if not isinstance(signal, dict):
+        raise ValueError("SIGNAL_NOT_DICT")
 
-    now = time.time()
-    active_oco = _has_active_oco()
+    # Case 1: Excel decision
+    if "action" in signal:
+        action = str(signal.get("action") or "").upper().strip()
+        if action not in ALLOWED_ACTIONS:
+            raise ValueError("INVALID_ACTION")
 
-    # ✅ hard block while position/OCO exists
-    if BLOCK_SIGNALS_WHEN_ACTIVE_OCO and active_oco:
-        if GEN_DEBUG:
-            logger.info("[GEN] SKIP | active_oco=True -> block new signals")
-        return False
+        if action == "SELL":
+            mode = str(signal.get("mode") or "").upper().strip()
+            if mode not in ALLOWED_SELL_MODES:
+                raise ValueError("INVALID_SELL_MODE")
 
-    elapsed = now - _last_emit_ts
-    if elapsed < COOLDOWN_SECONDS:
-        if GEN_DEBUG:
-            logger.info(f"[GEN] SKIP | cooldown_active left~{int(COOLDOWN_SECONDS - elapsed)}s")
-        return False
+            pct = _safe_float(signal.get("pct"))
+            if pct is None or not (0.0 < pct <= 1.0):
+                raise ValueError("INVALID_SELL_PCT")
 
-    sig = generate_signal()
-    if not sig:
-        return False
+            symbol = str(signal.get("symbol") or "").strip()
+            if not symbol:
+                raise ValueError("MISSING_SYMBOL")
 
-    symbol = (sig.get("execution") or {}).get("symbol")
-    direction = (sig.get("execution") or {}).get("direction")
-    signature = (str(symbol), str(direction))
+        return
 
-    # basic dedupe (now safe because we already blocked active_oco)
-    if _last_signature == signature:
-        _last_emit_ts = now
-        if GEN_DEBUG:
-            logger.info(f"[GEN] SKIP | dedupe_hit signature={signature}")
-        return False
+    # Case 2: Generator / trade payload
+    verdict = str(signal.get("final_verdict") or "").upper().strip()
+    if verdict not in ("TRADE", "HOLD"):
+        raise ValueError("INVALID_VERDICT")
 
-    try:
-        append_signal(sig, outbox_path)
-        _last_emit_ts = now
-        _last_signature = signature
-        if GEN_DEBUG:
-            logger.info(f"[GEN] OUTBOX_APPEND_OK | path={outbox_path} id={sig.get('signal_id')} signature={signature}")
-        return True
-    except Exception as e:
-        logger.exception(f"[GEN] OUTBOX_APPEND_FAIL | path={outbox_path} err={e}")
-        return False
+    if signal.get("certified_signal") is not True:
+        raise ValueError("NOT_CERTIFIED")
+
+    execution = signal.get("execution") or {}
+    symbol = execution.get("symbol")
+    direction = str(execution.get("direction") or "").upper().strip()
+    entry = execution.get("entry") or {}
+    entry_type = str(entry.get("type") or "").upper().strip()
+
+    if not symbol:
+        raise ValueError("MISSING_EXEC_SYMBOL")
+    if direction not in ("LONG", "SHORT"):
+        raise ValueError("INVALID_DIRECTION")
+    if entry_type not in ("MARKET", "LIMIT"):
+        raise ValueError("INVALID_ENTRY_TYPE")
+
+    # Optional numeric sanity
+    ps = _safe_float(execution.get("position_size"))
+    if ps is not None and ps <= 0:
+        raise ValueError("INVALID_POSITION_SIZE")
+
+    # mode_allowed sanity (if present)
+    ma = signal.get("mode_allowed")
+    if ma is not None and not isinstance(ma, dict):
+        raise ValueError("INVALID_MODE_ALLOWED")
+
+
+def _read_outbox(path: str) -> Dict[str, Any]:
+    if not os.path.exists(path):
+        return {"signals": []}
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        return {"signals": []}
+    if "signals" not in data or not isinstance(data["signals"], list):
+        data["signals"] = []
+    return data
+
+
+def _atomic_write_json(path: str, data: Dict[str, Any]) -> None:
+    d = os.path.dirname(path) or "."
+    os.makedirs(d, exist_ok=True)
+
+    with NamedTemporaryFile("w", delete=False, dir=d, encoding="utf-8") as tf:
+        json.dump(data, tf, ensure_ascii=False, indent=2)
+        tf.flush()
+        os.fsync(tf.fileno())
+        tmp = tf.name
+
+    os.replace(tmp, path)
+
+
+def append_signal(signal: Dict[str, Any], outbox_path: str) -> None:
+    validate_signal(signal)
+
+    # attach stable fingerprint for downstream dedupe
+    fp = _fingerprint(signal)
+    signal["_fingerprint"] = fp
+
+    data = _read_outbox(outbox_path)
+    signals: List[Dict[str, Any]] = data.get("signals", [])
+
+    # Soft outbox-level dedupe (still DB dedupe is the real protection)
+    if any((s.get("_fingerprint") == fp) for s in signals[-50:]):
+        logger.info(f"OUTBOX_DEDUPED | fingerprint={fp}")
+        return
+
+    signals.append(signal)
+    data["signals"] = signals
+    _atomic_write_json(outbox_path, data)
