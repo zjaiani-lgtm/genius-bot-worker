@@ -1,162 +1,101 @@
-# execution/signal_client.py
-
-from __future__ import annotations
-
 import json
 import os
-import tempfile
-from pathlib import Path
+import hashlib
+import logging
 from typing import Any, Dict, List, Optional
+from tempfile import NamedTemporaryFile
+
+logger = logging.getLogger("gbm")
 
 
-# Default path on Render persistent disk
-DEFAULT_OUTBOX_PATH = os.getenv("SIGNAL_OUTBOX_PATH", "/var/data/signal_outbox.json")
-
-
-class SignalClientError(Exception):
-    pass
-
-
-# ---------------- core helpers ----------------
-
-def ensure_signal_outbox_exists(path: str = DEFAULT_OUTBOX_PATH) -> Path:
-    """
-    Ensures that SIGNAL_OUTBOX exists and contains valid JSON:
-      {"signals": []}
-
-    If file is missing -> creates it.
-    If file exists but is corrupt/invalid -> heals it.
-    """
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-
-    if not p.exists():
-        _atomic_write_json(p, {"signals": []})
-        return p
-
-    # heal if invalid
+def _safe_float(x: Any) -> Optional[float]:
     try:
-        raw = p.read_text(encoding="utf-8")
-        data = json.loads(raw) if raw.strip() else {}
-        if not isinstance(data, dict) or "signals" not in data or not isinstance(data["signals"], list):
-            raise ValueError("invalid schema")
+        if x is None:
+            return None
+        return float(x)
     except Exception:
-        _atomic_write_json(p, {"signals": []})
-
-    return p
-
-
-def _read_outbox(path: str = DEFAULT_OUTBOX_PATH) -> Dict[str, Any]:
-    p = ensure_signal_outbox_exists(path)
-    try:
-        raw = p.read_text(encoding="utf-8")
-        return json.loads(raw) if raw.strip() else {"signals": []}
-    except Exception as e:
-        raise SignalClientError(f"Failed to read outbox JSON | path={p} | err={e}") from e
-
-
-def _write_outbox(payload: Dict[str, Any], path: str = DEFAULT_OUTBOX_PATH) -> None:
-    p = ensure_signal_outbox_exists(path)
-    if not isinstance(payload, dict):
-        raise SignalClientError("Outbox payload must be a dict")
-    if "signals" not in payload or not isinstance(payload["signals"], list):
-        raise SignalClientError("Outbox payload must contain list field: signals")
-    _atomic_write_json(p, payload)
-
-
-def _atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
-    """
-    Atomic write: write temp -> fsync -> replace.
-    Prevents half-written JSON on crashes/redeploys.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_fd, tmp_name = tempfile.mkstemp(prefix="outbox_", suffix=".json", dir=str(path.parent))
-    try:
-        with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_name, path)
-    finally:
-        try:
-            if os.path.exists(tmp_name):
-                os.remove(tmp_name)
-        except Exception:
-            pass
-
-
-# ---------------- NEW API (optional) ----------------
-
-def pop_next_signal(path: str = DEFAULT_OUTBOX_PATH) -> Optional[Dict[str, Any]]:
-    """
-    Pops first signal FIFO and persists.
-    """
-    data = _read_outbox(path)
-    signals: List[Dict[str, Any]] = data.get("signals", [])
-    if not signals:
         return None
-    sig = signals.pop(0)
-    _write_outbox({"signals": signals}, path)
-    return sig
 
 
-def append_signal(signal: Dict[str, Any], path: str = DEFAULT_OUTBOX_PATH) -> None:
-    """
-    Appends a signal to outbox queue.
-    """
+def _fingerprint(signal: Dict[str, Any]) -> str:
+    execution = signal.get("execution") or {}
+    symbol = str(execution.get("symbol") or "").upper().strip()
+    direction = str(execution.get("direction") or "").upper().strip()
+    entry_type = str((execution.get("entry") or {}).get("type") or "").upper().strip()
+    pos_size = _safe_float(execution.get("position_size"))
+
+    base = f"v1:TRADE:{symbol}:{direction}:{entry_type}:{pos_size}"
+    return hashlib.sha256(base.encode("utf-8")).hexdigest()
+
+
+def validate_signal(signal: Dict[str, Any]) -> None:
     if not isinstance(signal, dict):
-        raise SignalClientError("signal must be a dict")
-    data = _read_outbox(path)
+        raise ValueError("SIGNAL_NOT_DICT")
+
+    verdict = str(signal.get("final_verdict") or "").upper().strip()
+    if verdict not in ("TRADE", "HOLD"):
+        raise ValueError("INVALID_VERDICT")
+
+    if signal.get("certified_signal") is not True:
+        raise ValueError("NOT_CERTIFIED")
+
+    execution = signal.get("execution") or {}
+    symbol = execution.get("symbol")
+    direction = str(execution.get("direction") or "").upper().strip()
+    entry = execution.get("entry") or {}
+    entry_type = str(entry.get("type") or "").upper().strip()
+
+    if not symbol:
+        raise ValueError("MISSING_EXEC_SYMBOL")
+    if direction != "LONG":
+        raise ValueError("INVALID_DIRECTION")
+    if entry_type != "MARKET":
+        raise ValueError("INVALID_ENTRY_TYPE")
+
+    ps = _safe_float(execution.get("position_size"))
+    if ps is None or ps <= 0:
+        raise ValueError("INVALID_POSITION_SIZE")
+
+
+def _read_outbox(path: str) -> Dict[str, Any]:
+    if not os.path.exists(path):
+        return {"signals": []}
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        return {"signals": []}
+    if "signals" not in data or not isinstance(data["signals"], list):
+        data["signals"] = []
+    return data
+
+
+def _atomic_write_json(path: str, data: Dict[str, Any]) -> None:
+    d = os.path.dirname(path) or "."
+    os.makedirs(d, exist_ok=True)
+
+    with NamedTemporaryFile("w", delete=False, dir=d, encoding="utf-8") as tf:
+        json.dump(data, tf, ensure_ascii=False, indent=2)
+        tf.flush()
+        os.fsync(tf.fileno())
+        tmp = tf.name
+
+    os.replace(tmp, path)
+
+
+def append_signal(signal: Dict[str, Any], outbox_path: str) -> None:
+    validate_signal(signal)
+
+    fp = _fingerprint(signal)
+    signal["_fingerprint"] = fp
+
+    data = _read_outbox(outbox_path)
     signals: List[Dict[str, Any]] = data.get("signals", [])
+
+    # outbox-level soft dedupe (DB dedupe is the real safety)
+    if any((s.get("_fingerprint") == fp) for s in signals[-50:]):
+        logger.info(f"OUTBOX_DEDUPED | fingerprint={fp}")
+        return
+
     signals.append(signal)
-    _write_outbox({"signals": signals}, path)
-
-
-# ---------------- BACKWARD-COMPAT API (for your current main.py) ----------------
-# main.py imports these names:
-#   from execution.signal_client import get_latest_signal, acknowledge_processed
-
-def get_latest_signal(path: str = DEFAULT_OUTBOX_PATH) -> Optional[Dict[str, Any]]:
-    """
-    Backward-compatible:
-    Returns the *first* signal in queue (FIFO) WITHOUT removing it.
-    Returns None if no signals.
-    """
-    data = _read_outbox(path)
-    signals: List[Dict[str, Any]] = data.get("signals", [])
-    if not signals:
-        return None
-    sig = signals[0]
-    if not isinstance(sig, dict):
-        return None
-    return sig
-
-
-def acknowledge_processed(signal_id: str, path: str = DEFAULT_OUTBOX_PATH) -> bool:
-    """
-    Backward-compatible:
-    Removes a signal from outbox after it is processed.
-
-    Strategy:
-      - Remove the first signal whose signal_id matches provided signal_id.
-      - If not found, do nothing (return False).
-    """
-    if not signal_id:
-        return False
-
-    data = _read_outbox(path)
-    signals: List[Dict[str, Any]] = data.get("signals", [])
-
-    new_signals: List[Dict[str, Any]] = []
-    removed = False
-
-    for s in signals:
-        if not removed and isinstance(s, dict) and s.get("signal_id") == signal_id:
-            removed = True
-            continue
-        new_signals.append(s)
-
-    if removed:
-        _write_outbox({"signals": new_signals}, path)
-
-    return removed
+    data["signals"] = signals
+    _atomic_write_json(outbox_path, data)
