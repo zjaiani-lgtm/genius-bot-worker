@@ -1,3 +1,4 @@
+# execution/signal_client.py
 import json
 import os
 import hashlib
@@ -19,16 +20,18 @@ def _safe_float(x: Any) -> Optional[float]:
 
 def _fingerprint(signal: Dict[str, Any]) -> str:
     """
-    Fingerprint is ONLY for debug / audit.
-    Execution idempotency must use signal_id, not this.
+    Stable fingerprint for idempotency.
+    IMPORTANT: do NOT use uuid/signal_id inside hash.
     """
+    verdict = str(signal.get("final_verdict") or "").upper().strip()
+
     execution = signal.get("execution") or {}
     symbol = str(execution.get("symbol") or "").upper().strip()
     direction = str(execution.get("direction") or "").upper().strip()
     entry_type = str((execution.get("entry") or {}).get("type") or "").upper().strip()
     pos_size = _safe_float(execution.get("position_size"))
 
-    base = f"v1:TRADE:{symbol}:{direction}:{entry_type}:{pos_size}"
+    base = f"v1:{verdict}:{symbol}:{direction}:{entry_type}:{pos_size}"
     return hashlib.sha256(base.encode("utf-8")).hexdigest()
 
 
@@ -95,12 +98,21 @@ def append_signal(signal: Dict[str, Any], outbox_path: str) -> None:
     data = _read_outbox(outbox_path)
     signals: List[Dict[str, Any]] = data.get("signals", [])
 
+    # soft dedupe in outbox (DB dedupe is the real safety net)
+    if any((s.get("_fingerprint") == fp) for s in signals[-50:]):
+        logger.info(f"OUTBOX_DEDUPED | fingerprint={fp}")
+        return
+
     signals.append(signal)
     data["signals"] = signals
     _atomic_write_json(outbox_path, data)
 
 
 def pop_next_signal(outbox_path: str) -> Optional[Dict[str, Any]]:
+    """
+    Pops FIFO: takes the oldest signal from outbox.
+    Atomic rewrite.
+    """
     data = _read_outbox(outbox_path)
     signals: List[Dict[str, Any]] = data.get("signals", [])
     if not signals:
