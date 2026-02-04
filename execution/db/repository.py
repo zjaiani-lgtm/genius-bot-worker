@@ -1,4 +1,3 @@
-# execution/db/repository.py
 from datetime import datetime
 from execution.db.db import get_connection
 
@@ -187,7 +186,6 @@ def signal_already_executed(signal_hash: str) -> bool:
     conn.close()
     return row is not None
 
-
 def mark_signal_executed(signal_hash: str, signal_id: str = None, action: str = None, symbol: str = None):
     conn = get_connection()
     cur = conn.cursor()
@@ -206,4 +204,3 @@ def mark_signal_executed(signal_hash: str, signal_id: str = None, action: str = 
     )
     conn.commit()
     conn.close()
-
