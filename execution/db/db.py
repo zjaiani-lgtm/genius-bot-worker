@@ -73,5 +73,18 @@ def init_db():
     )
     """)
 
+        # ✅ executed signals (idempotency / dedupe)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS executed_signals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        signal_hash TEXT NOT NULL UNIQUE,
+        signal_id TEXT,
+        action TEXT,
+        symbol TEXT,
+        executed_at TEXT NOT NULL
+    )
+    """)
+
+
     conn.commit()
     conn.close()
