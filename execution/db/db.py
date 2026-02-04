@@ -1,4 +1,3 @@
-# execution/db/db.py
 import sqlite3
 from execution.config import DB_PATH
 
