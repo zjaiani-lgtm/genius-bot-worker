@@ -1,3 +1,4 @@
+# execution/db/db.py
 import sqlite3
 from execution.config import DB_PATH
 
@@ -71,12 +72,11 @@ def init_db():
     )
     """)
 
-    # ✅ executed signals (idempotency)
+    # ✅ executed signals (idempotency) — DEDUPE BY signal_id
     cur.execute("""
     CREATE TABLE IF NOT EXISTS executed_signals (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        signal_hash TEXT NOT NULL UNIQUE,
-        signal_id TEXT,
+        signal_id TEXT PRIMARY KEY,
+        signal_hash TEXT,
         action TEXT,
         symbol TEXT,
         executed_at TEXT NOT NULL
