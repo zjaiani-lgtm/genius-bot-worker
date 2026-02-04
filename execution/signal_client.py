@@ -19,8 +19,8 @@ def _safe_float(x: Any) -> Optional[float]:
 
 def _fingerprint(signal: Dict[str, Any]) -> str:
     """
-    Stable fingerprint for idempotency.
-    For now supports your TRADE payload. (Excel SELL schema can be added later)
+    Fingerprint is ONLY for debug / audit.
+    Execution idempotency must use signal_id, not this.
     """
     execution = signal.get("execution") or {}
     symbol = str(execution.get("symbol") or "").upper().strip()
@@ -64,14 +64,8 @@ def validate_signal(signal: Dict[str, Any]) -> None:
 def _read_outbox(path: str) -> Dict[str, Any]:
     if not os.path.exists(path):
         return {"signals": []}
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception:
-        # If file is corrupted, do not crash worker
-        logger.exception(f"OUTBOX_READ_FAIL | path={path} -> reset empty")
-        return {"signals": []}
-
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
     if not isinstance(data, dict):
         return {"signals": []}
     if "signals" not in data or not isinstance(data["signals"], list):
@@ -93,9 +87,6 @@ def _atomic_write_json(path: str, data: Dict[str, Any]) -> None:
 
 
 def append_signal(signal: Dict[str, Any], outbox_path: str) -> None:
-    """
-    Producer writes signals to outbox safely.
-    """
     validate_signal(signal)
 
     fp = _fingerprint(signal)
@@ -104,36 +95,18 @@ def append_signal(signal: Dict[str, Any], outbox_path: str) -> None:
     data = _read_outbox(outbox_path)
     signals: List[Dict[str, Any]] = data.get("signals", [])
 
-    # outbox-level soft dedupe (DB dedupe is the real safety)
-    if any((s.get("_fingerprint") == fp) for s in signals[-50:]):
-        logger.info(f"OUTBOX_DEDUPED | fingerprint={fp}")
-        return
-
     signals.append(signal)
     data["signals"] = signals
     _atomic_write_json(outbox_path, data)
 
 
 def pop_next_signal(outbox_path: str) -> Optional[Dict[str, Any]]:
-    """
-    Consumer pops next signal from outbox (FIFO) atomically.
-    Returns None if empty.
-    """
     data = _read_outbox(outbox_path)
     signals: List[Dict[str, Any]] = data.get("signals", [])
-
     if not signals:
         return None
 
-    sig = signals.pop(0)  # FIFO
+    sig = signals.pop(0)
     data["signals"] = signals
     _atomic_write_json(outbox_path, data)
-
-    # ensure fingerprint exists (older signals might not have it)
-    if isinstance(sig, dict) and "_fingerprint" not in sig:
-        try:
-            sig["_fingerprint"] = _fingerprint(sig)
-        except Exception:
-            pass
-
     return sig
