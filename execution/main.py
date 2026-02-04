@@ -1,3 +1,4 @@
+# execution/main.py
 import os
 import time
 import logging
@@ -14,7 +15,6 @@ logger = logging.getLogger("gbm")
 
 def _bootstrap_state_if_needed() -> None:
     raw = get_system_state()
-    # tuple: (id, status, startup_sync_ok, kill_switch, updated_at)
     if not isinstance(raw, (list, tuple)) or len(raw) < 5:
         logger.warning("BOOTSTRAP_STATE | system_state row missing or invalid -> skip")
         return
@@ -68,8 +68,6 @@ def main():
     logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(asctime)s - %(message)s')
 
     mode = os.getenv("MODE", "DEMO").upper()
-
-    # keep env name consistent with your original
     outbox_path = os.getenv("SIGNAL_OUTBOX_PATH", "/var/data/signal_outbox.json")
     sleep_s = float(os.getenv("LOOP_SLEEP_SECONDS", "10"))
 
@@ -91,12 +89,23 @@ def main():
 
     while True:
         try:
+            # 0) ABSOLUTE KILL SWITCH (before everything)
+            if is_kill_switch_active():
+                logger.warning("KILL_SWITCH_ACTIVE | worker will not generate/pop/execute signals")
+                try:
+                    log_event("WORKER_KILL_SWITCH_ACTIVE", "blocked before loop actions")
+                except Exception:
+                    pass
+                time.sleep(sleep_s)
+                continue
+
+            # 1) reconcile OCO
             try:
                 engine.reconcile_oco()
             except Exception as e:
                 logger.warning(f"OCO_RECONCILE_LOOP_WARN | err={e}")
 
-            # 1) generate (optional)
+            # 2) generate (optional)
             if generate_once is not None:
                 try:
                     created = generate_once(outbox_path)
@@ -108,18 +117,6 @@ def main():
                         log_event("SIGNAL_GENERATOR_FAIL", f"err={e}")
                     except Exception:
                         pass
-
-            # 2) kill switch gate
-            if is_kill_switch_active():
-                logger.warning("KILL_SWITCH_ACTIVE | worker will not execute signals")
-                try:
-                    log_event("WORKER_KILL_SWITCH_ACTIVE", "execution blocked in main loop")
-                except Exception:
-                    pass
-
-                # default: do NOT pop signals while kill switch is active (keeps backlog)
-                time.sleep(sleep_s)
-                continue
 
             # 3) pop + execute
             sig = _safe_pop_next_signal(outbox_path)
