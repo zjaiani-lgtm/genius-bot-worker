@@ -80,6 +80,9 @@ class ExecutionEngine:
 
         return {"status": "", "startup_sync_ok": False, "kill_switch": False}
 
+    # ----------------------------
+    # OCO reconcile
+    # ----------------------------
     def reconcile_oco(self) -> None:
         if self.mode not in ("LIVE", "TESTNET"):
             return
@@ -141,13 +144,16 @@ class ExecutionEngine:
             except Exception as e:
                 logger.warning(f"OCO_RECONCILE_FAIL | link={link_id} symbol={symbol} err={e}")
 
+    # ----------------------------
+    # Main execution
+    # ----------------------------
     def execute_signal(self, signal: Dict[str, Any]) -> None:
         signal_id = str(signal.get("signal_id", "UNKNOWN"))
         verdict = str(signal.get("final_verdict", "")).upper()
 
         logger.info(f"EXEC_ENTER | id={signal_id} verdict={verdict} MODE={self.mode} ENV_KILL_SWITCH={self.env_kill_switch}")
 
-        # ✅ IDEMPOTENCY: DEDUPE BY signal_id
+        # ✅ IDEMPOTENCY: dedupe by signal_id
         try:
             if signal_id_already_executed(signal_id):
                 logger.warning(f"EXEC_DEDUPED | duplicate ignored | id={signal_id}")
@@ -222,19 +228,20 @@ class ExecutionEngine:
                 quote_amount = float(position_size) * float(last)
             quote_amount = float(quote_amount)
 
-            # ✅ LAST-MILLISECOND KILL SWITCH (before BUY)
+            # ✅ last-millisecond kill switch
             if is_kill_switch_active():
                 logger.error(f"KILL_SWITCH_ACTIVE_LAST_GATE | BUY_BLOCKED | id={signal_id}")
                 log_event("EXEC_BLOCKED_KILL_SWITCH_LAST_GATE", f"{signal_id} BUY_BLOCKED")
                 return
 
+            # BUY
             buy = self.exchange.place_market_buy_by_quote(symbol=symbol, quote_amount=quote_amount)
             buy_avg = float(buy.get("average") or buy.get("price") or 0.0) or self.exchange.fetch_last_price(symbol)
 
             logger.info(f"EXEC_LIVE_BUY_OK | id={signal_id} symbol={symbol} quote={quote_amount} avg={buy_avg} order_id={buy.get('id')}")
             log_event("TRADE_EXECUTED", f"{signal_id} LIVE BUY {symbol} quote={quote_amount} avg={buy_avg} order_id={buy.get('id')}")
 
-            # ✅ mark executed right after BUY (avoid double-buy on retries)
+            # ✅ mark executed right after BUY (prevents double-buy)
             mark_signal_id_executed(signal_id, signal_hash=signal_hash, action="TRADE_LIVE_BUY", symbol=str(symbol))
 
             base_asset = symbol.split("/")[0].upper()
@@ -259,12 +266,12 @@ class ExecutionEngine:
                 f"tp={tp_price} sl_stop={sl_stop_price} sl_limit={sl_limit_price}"
             )
 
-            # ✅ LAST-MILLISECOND KILL SWITCH (before OCO)
             if is_kill_switch_active():
                 logger.error(f"KILL_SWITCH_ACTIVE_LAST_GATE | OCO_BLOCKED | id={signal_id}")
                 log_event("EXEC_BLOCKED_KILL_SWITCH_LAST_GATE", f"{signal_id} OCO_BLOCKED")
                 return
 
+            # OCO place
             oco = self.exchange.place_oco_sell(
                 symbol=symbol,
                 base_amount=sell_amount,
@@ -275,32 +282,48 @@ class ExecutionEngine:
 
             raw = oco.get("raw") or {}
             order_reports = raw.get("orderReports") or []
+
             tp_order_id = None
             sl_order_id = None
 
+            def _otype(rep):
+                return str(rep.get("type") or rep.get("orderType") or "").upper()
+
+            # ✅ FIX: STOP_LOSS_LIMIT contains "STOP" so it's SL
             for rep in order_reports:
-                typ = str(rep.get("type") or "").upper()
-                oid = str(rep.get("orderId") or rep.get("order_id") or "")
+                oid = rep.get("orderId") or rep.get("order_id")
                 if not oid:
                     continue
-                if "LIMIT" in typ:
-                    tp_order_id = oid or tp_order_id
-                else:
-                    sl_order_id = oid or sl_order_id
+                oid = str(oid)
+                typ = _otype(rep)
 
+                if "STOP" in typ:
+                    sl_order_id = sl_order_id or oid
+                else:
+                    tp_order_id = tp_order_id or oid
+
+            # fallback: raw["orders"]
             orders = raw.get("orders") or []
             if (not tp_order_id or not sl_order_id) and len(orders) >= 2:
-                ids = [str(o.get("orderId") or "") for o in orders if o.get("orderId")]
-                if len(ids) >= 2:
-                    tp_order_id = tp_order_id or ids[0]
-                    sl_order_id = sl_order_id or ids[1]
+                ids = []
+                for o in orders:
+                    oid = o.get("orderId") or o.get("order_id")
+                    if oid:
+                        ids.append(str(oid))
+                uniq = []
+                for x in ids:
+                    if x not in uniq:
+                        uniq.append(x)
+                if len(uniq) >= 2:
+                    tp_order_id = tp_order_id or uniq[0]
+                    sl_order_id = sl_order_id or uniq[1]
 
             list_order_id = raw.get("listOrderId") or raw.get("orderListId") or raw.get("list_order_id")
 
             logger.info(f"OCO_OK | id={signal_id} listOrderId={list_order_id} tp={tp_order_id} sl={sl_order_id}")
             log_event("OCO_ARMED", f"{signal_id} symbol={symbol} listOrderId={list_order_id} tp={tp_order_id} sl={sl_order_id} amount={sell_amount}")
 
-            # 🔥 CRITICAL: OCO must be valid
+            # ✅ FAILSAFE: must be valid
             if (not list_order_id) or (not tp_order_id) or (not sl_order_id) or (str(tp_order_id) == str(sl_order_id)):
                 msg = (
                     f"OCO_INVALID | id={signal_id} symbol={symbol} "
@@ -309,7 +332,6 @@ class ExecutionEngine:
                 logger.error(msg)
                 log_event("OCO_INVALID", msg)
 
-                # failsafe: stop the system
                 update_system_state(kill_switch=1)
                 logger.error("FAILSAFE | DB kill_switch=1 set due to OCO_INVALID")
                 log_event("FAILSAFE_KILL_SWITCH_SET", f"{signal_id} OCO_INVALID")
@@ -327,7 +349,6 @@ class ExecutionEngine:
                 amount=float(sell_amount),
             )
 
-            # optional: mark "armed" too
             log_event("TRADE_LIVE_ARMED", f"{signal_id} {symbol} OCO_ARMED listOrderId={list_order_id}")
 
         except Exception as e:
