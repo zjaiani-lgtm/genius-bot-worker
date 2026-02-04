@@ -1,4 +1,3 @@
-# execution/main.py
 import os
 import time
 import logging
@@ -14,10 +13,6 @@ logger = logging.getLogger("gbm")
 
 
 def _bootstrap_state_if_needed() -> None:
-    """
-    Prevent getting stuck after redeploys when DB is persisted on Render Disk.
-    If user intentionally paused via DB, keep KILL_SWITCH=true to enforce stop.
-    """
     raw = get_system_state()
     # tuple: (id, status, startup_sync_ok, kill_switch, updated_at)
     if not isinstance(raw, (list, tuple)) or len(raw) < 5:
@@ -35,22 +30,16 @@ def _bootstrap_state_if_needed() -> None:
         f"kill_db={kill_switch_db} env_kill={env_kill}"
     )
 
-    # If kill switch is on (env or db), do not override anything
     if env_kill or kill_switch_db == 1:
         logger.warning("BOOTSTRAP_STATE | kill switch ON -> skip overrides")
         return
 
-    # If stuck, self-heal to RUNNING + sync_ok=1
     if status == "PAUSED" or startup_sync_ok == 0:
         logger.warning("BOOTSTRAP_STATE | applying self-heal -> status=RUNNING startup_sync_ok=1 kill_switch=0")
         update_system_state(status="RUNNING", startup_sync_ok=1, kill_switch=0)
 
 
 def _try_import_generator():
-    """
-    Make generator import robust: worker should still run even if generator code is missing/broken.
-    Returns a callable generate_once(outbox_path) or None.
-    """
     try:
         from execution.signal_generator import run_once as generate_once
         return generate_once
@@ -64,9 +53,6 @@ def _try_import_generator():
 
 
 def _safe_pop_next_signal(outbox_path: str) -> Optional[Dict[str, Any]]:
-    """
-    Wrapper to safely pop signals; if pop fails we log and keep loop alive.
-    """
     try:
         return pop_next_signal(outbox_path)
     except Exception as e:
@@ -83,7 +69,7 @@ def main():
 
     mode = os.getenv("MODE", "DEMO").upper()
 
-    # IMPORTANT: keep your env name consistent
+    # keep env name consistent with your original
     outbox_path = os.getenv("SIGNAL_OUTBOX_PATH", "/var/data/signal_outbox.json")
     sleep_s = float(os.getenv("LOOP_SLEEP_SECONDS", "10"))
 
@@ -92,7 +78,6 @@ def main():
 
     engine = ExecutionEngine()
 
-    # Optional: quick reconcile at start
     try:
         engine.reconcile_oco()
     except Exception as e:
@@ -106,13 +91,12 @@ def main():
 
     while True:
         try:
-            # reconcile native/synthetic OCO
             try:
                 engine.reconcile_oco()
             except Exception as e:
                 logger.warning(f"OCO_RECONCILE_LOOP_WARN | err={e}")
 
-            # 1) generate signal (optional)
+            # 1) generate (optional)
             if generate_once is not None:
                 try:
                     created = generate_once(outbox_path)
@@ -125,8 +109,7 @@ def main():
                     except Exception:
                         pass
 
-            # 2) kill switch absolute gate (before consume)
-            # If kill switch active, do NOT execute anything.
+            # 2) kill switch gate
             if is_kill_switch_active():
                 logger.warning("KILL_SWITCH_ACTIVE | worker will not execute signals")
                 try:
@@ -134,17 +117,7 @@ def main():
                 except Exception:
                     pass
 
-                # Option A (default safety): still pop one signal per loop to prevent outbox growth,
-                # but DO NOT execute it. This avoids a backlog bomb after re-enable.
-                sig = _safe_pop_next_signal(outbox_path)
-                if sig:
-                    sid = sig.get("signal_id")
-                    logger.warning(f"KILL_SWITCH_DROP_SIGNAL | id={sid}")
-                    try:
-                        log_event("KILL_SWITCH_DROP_SIGNAL", f"id={sid}")
-                    except Exception:
-                        pass
-
+                # default: do NOT pop signals while kill switch is active (keeps backlog)
                 time.sleep(sleep_s)
                 continue
 
