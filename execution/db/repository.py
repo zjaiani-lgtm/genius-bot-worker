@@ -175,28 +175,29 @@ def list_active_oco_links(limit: int = 50):
 
 # ---------------- EXECUTED SIGNALS (IDEMPOTENCY) ----------------
 
-def signal_already_executed(signal_hash: str) -> bool:
+def signal_id_already_executed(signal_id: str) -> bool:
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
-        "SELECT 1 FROM executed_signals WHERE signal_hash = ? LIMIT 1",
-        (str(signal_hash),)
+        "SELECT 1 FROM executed_signals WHERE signal_id = ? LIMIT 1",
+        (str(signal_id),)
     )
     row = cur.fetchone()
     conn.close()
     return row is not None
 
-def mark_signal_executed(signal_hash: str, signal_id: str = None, action: str = None, symbol: str = None):
+
+def mark_signal_id_executed(signal_id: str, signal_hash: str = None, action: str = None, symbol: str = None):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT OR IGNORE INTO executed_signals (signal_hash, signal_id, action, symbol, executed_at)
+        INSERT OR IGNORE INTO executed_signals (signal_id, signal_hash, action, symbol, executed_at)
         VALUES (?, ?, ?, ?, ?)
         """,
         (
-            str(signal_hash),
-            str(signal_id) if signal_id is not None else None,
+            str(signal_id),
+            str(signal_hash) if signal_hash is not None else None,
             str(action) if action is not None else None,
             str(symbol) if symbol is not None else None,
             datetime.utcnow().isoformat()
@@ -204,3 +205,4 @@ def mark_signal_executed(signal_hash: str, signal_id: str = None, action: str = 
     )
     conn.commit()
     conn.close()
+
