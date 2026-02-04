@@ -173,3 +173,37 @@ def list_active_oco_links(limit: int = 50):
     rows = cur.fetchall()
     conn.close()
     return rows
+
+# ---------------- EXECUTED SIGNALS (IDEMPOTENCY) ----------------
+
+def signal_already_executed(signal_hash: str) -> bool:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT 1 FROM executed_signals WHERE signal_hash = ? LIMIT 1",
+        (str(signal_hash),)
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row is not None
+
+
+def mark_signal_executed(signal_hash: str, signal_id: str = None, action: str = None, symbol: str = None):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT OR IGNORE INTO executed_signals (signal_hash, signal_id, action, symbol, executed_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            str(signal_hash),
+            str(signal_id) if signal_id is not None else None,
+            str(action) if action is not None else None,
+            str(symbol) if symbol is not None else None,
+            datetime.utcnow().isoformat()
+        )
+    )
+    conn.commit()
+    conn.close()
+
