@@ -1,6 +1,4 @@
-# execution/db/db.py
 import sqlite3
-from pathlib import Path
 from execution.config import DB_PATH
 
 
@@ -38,7 +36,7 @@ def init_db():
     )
     """)
 
-    # system state (for gates)
+    # system state
     cur.execute("""
     CREATE TABLE IF NOT EXISTS system_state (
         id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -54,7 +52,7 @@ def init_db():
     VALUES (1, 'RUNNING', 0, 0, datetime('now'))
     """)
 
-    # ✅ OCO links (synthetic OCO: TP + SL orders)
+    # oco links
     cur.execute("""
     CREATE TABLE IF NOT EXISTS oco_links (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -67,13 +65,13 @@ def init_db():
         sl_stop_price REAL NOT NULL,
         sl_limit_price REAL NOT NULL,
         amount REAL NOT NULL,
-        status TEXT NOT NULL,              -- ACTIVE / CLOSED_TP / CLOSED_SL / NEEDS_RETRY / FAILED
+        status TEXT NOT NULL,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
     )
     """)
 
-        # ✅ executed signals (idempotency / dedupe)
+    # ✅ executed signals (idempotency)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS executed_signals (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -84,7 +82,6 @@ def init_db():
         executed_at TEXT NOT NULL
     )
     """)
-
 
     conn.commit()
     conn.close()
