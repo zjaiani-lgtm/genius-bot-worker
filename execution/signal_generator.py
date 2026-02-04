@@ -139,11 +139,11 @@ def run_once(outbox_path: str) -> bool:
     direction = (sig.get("execution") or {}).get("direction")
     signature = (str(symbol), str(direction))
 
-    if _last_signature == signature:
-        _last_emit_ts = now
-        if GEN_DEBUG:
-            logger.info(f"[GEN] SKIP | dedupe_hit signature={signature}")
-        return False
+    # if _last_signature == signature:
+    #     _last_emit_ts = now
+    #     if GEN_DEBUG:
+    #         logger.info(f"[GEN] SKIP | dedupe_hit signature={signature}")
+    #     return False
 
     try:
         append_signal(sig, outbox_path)
