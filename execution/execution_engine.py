@@ -10,8 +10,9 @@ from execution.db.repository import (
     list_active_oco_links,
     create_oco_link,
     set_oco_status,
-    signal_already_executed,
-    mark_signal_executed,
+    update_system_state,
+    signal_id_already_executed,
+    mark_signal_id_executed,
 )
 
 from execution.kill_switch import is_kill_switch_active
@@ -146,18 +147,16 @@ class ExecutionEngine:
 
         logger.info(f"EXEC_ENTER | id={signal_id} verdict={verdict} MODE={self.mode} ENV_KILL_SWITCH={self.env_kill_switch}")
 
-        # ✅ DEDUPE (idempotency)
-        signal_hash = signal.get("_fingerprint") or signal.get("signal_hash")
-        if signal_hash:
-            try:
-                if signal_already_executed(signal_hash):
-                    logger.warning(f"EXEC_DEDUPED | duplicate ignored | id={signal_id} hash={signal_hash}")
-                    log_event("EXEC_DEDUPED", f"{signal_id} hash={signal_hash}")
-                    return
-            except Exception as e:
-                logger.error(f"EXEC_BLOCKED | dedupe_check_failed | id={signal_id} err={e}")
-                log_event("EXEC_BLOCKED_DEDUPE_CHECK_FAIL", f"{signal_id} err={e}")
+        # ✅ IDEMPOTENCY: DEDUPE BY signal_id
+        try:
+            if signal_id_already_executed(signal_id):
+                logger.warning(f"EXEC_DEDUPED | duplicate ignored | id={signal_id}")
+                log_event("EXEC_DEDUPED", f"id={signal_id}")
                 return
+        except Exception as e:
+            logger.error(f"EXEC_BLOCKED | idempotency_check_failed | id={signal_id} err={e}")
+            log_event("EXEC_BLOCKED_IDEMPOTENCY_FAIL", f"{signal_id} err={e}")
+            return
 
         state = self._load_system_state()
         db_status = str(state.get("status") or "").upper()
@@ -197,16 +196,18 @@ class ExecutionEngine:
             log_event("REJECT_BAD_PAYLOAD", f"{signal_id}")
             return
 
+        signal_hash = signal.get("_fingerprint") or signal.get("signal_hash")
+
         # DEMO
         if self.mode == "DEMO":
             last_price = float(self.price_feed.fetch_ticker(symbol)["last"])
             base_size = float(position_size) if position_size is not None else float(quote_amount) / float(last_price)
             resp = simulate_market_entry(symbol=symbol, side=direction, size=base_size, price=last_price)
+
             log_event("TRADE_EXECUTED", f"{signal_id} DEMO {symbol} size={base_size} price={last_price}")
             logger.info(f"EXEC_DEMO_OK | id={signal_id} resp={resp}")
 
-            if signal_hash:
-                mark_signal_executed(signal_hash, signal_id=signal_id, action="TRADE_DEMO", symbol=str(symbol))
+            mark_signal_id_executed(signal_id, signal_hash=signal_hash, action="TRADE_DEMO", symbol=str(symbol))
             return
 
         # LIVE/TESTNET
@@ -233,8 +234,10 @@ class ExecutionEngine:
             logger.info(f"EXEC_LIVE_BUY_OK | id={signal_id} symbol={symbol} quote={quote_amount} avg={buy_avg} order_id={buy.get('id')}")
             log_event("TRADE_EXECUTED", f"{signal_id} LIVE BUY {symbol} quote={quote_amount} avg={buy_avg} order_id={buy.get('id')}")
 
-            base_asset = symbol.split("/")[0].upper()
+            # ✅ mark executed right after BUY (avoid double-buy on retries)
+            mark_signal_id_executed(signal_id, signal_hash=signal_hash, action="TRADE_LIVE_BUY", symbol=str(symbol))
 
+            base_asset = symbol.split("/")[0].upper()
             free_base = float(self.exchange.fetch_balance_free(base_asset))
 
             sell_amount = self.exchange.floor_amount(symbol, free_base * self.sell_buffer)
@@ -292,8 +295,25 @@ class ExecutionEngine:
                     tp_order_id = tp_order_id or ids[0]
                     sl_order_id = sl_order_id or ids[1]
 
-            logger.info(f"OCO_OK | id={signal_id} listOrderId={raw.get('listOrderId')} tp={tp_order_id} sl={sl_order_id}")
-            log_event("OCO_ARMED", f"{signal_id} symbol={symbol} listOrderId={raw.get('listOrderId')} tp={tp_order_id} sl={sl_order_id} amount={sell_amount}")
+            list_order_id = raw.get("listOrderId") or raw.get("orderListId") or raw.get("list_order_id")
+
+            logger.info(f"OCO_OK | id={signal_id} listOrderId={list_order_id} tp={tp_order_id} sl={sl_order_id}")
+            log_event("OCO_ARMED", f"{signal_id} symbol={symbol} listOrderId={list_order_id} tp={tp_order_id} sl={sl_order_id} amount={sell_amount}")
+
+            # 🔥 CRITICAL: OCO must be valid
+            if (not list_order_id) or (not tp_order_id) or (not sl_order_id) or (str(tp_order_id) == str(sl_order_id)):
+                msg = (
+                    f"OCO_INVALID | id={signal_id} symbol={symbol} "
+                    f"listOrderId={list_order_id} tp={tp_order_id} sl={sl_order_id} -> PROTECTION_FAILED"
+                )
+                logger.error(msg)
+                log_event("OCO_INVALID", msg)
+
+                # failsafe: stop the system
+                update_system_state(kill_switch=1)
+                logger.error("FAILSAFE | DB kill_switch=1 set due to OCO_INVALID")
+                log_event("FAILSAFE_KILL_SWITCH_SET", f"{signal_id} OCO_INVALID")
+                return
 
             create_oco_link(
                 signal_id=signal_id,
@@ -307,8 +327,8 @@ class ExecutionEngine:
                 amount=float(sell_amount),
             )
 
-            if signal_hash:
-                mark_signal_executed(signal_hash, signal_id=signal_id, action="TRADE_LIVE", symbol=str(symbol))
+            # optional: mark "armed" too
+            log_event("TRADE_LIVE_ARMED", f"{signal_id} {symbol} OCO_ARMED listOrderId={list_order_id}")
 
         except Exception as e:
             logger.exception(f"EXEC_LIVE_ERROR | id={signal_id} err={e}")
