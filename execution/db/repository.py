@@ -173,6 +173,27 @@ def list_active_oco_links(limit: int = 50):
     conn.close()
     return rows
 
+def has_active_oco_for_symbol(symbol: str) -> bool:
+    """
+    True თუ მოცემულ symbol-ზე (მაგ: BTC/USDT) არსებობს ACTIVE OCO.
+    ეს გვჭირდება multi-symbol გენერატორში, რომ 1 აქტიურმა OCO-მ
+    არ დაბლოკოს სხვა ქოინებზე სიგნალების გენერაცია.
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT 1
+        FROM oco_links
+        WHERE status='ACTIVE' AND UPPER(symbol)=UPPER(?)
+        LIMIT 1
+        """,
+        (str(symbol),)
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row is not None
+
 # ---------------- EXECUTED SIGNALS (IDEMPOTENCY) ----------------
 
 def signal_id_already_executed(signal_id: str) -> bool:
