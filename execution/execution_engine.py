@@ -228,6 +228,29 @@ class ExecutionEngine:
                 quote_amount = float(position_size) * float(last)
             quote_amount = float(quote_amount)
 
+            # ✅ Binance NOTIONAL gate (prevents -1013 Filter failure: NOTIONAL)
+            min_notional = 0.0
+            try:
+                min_notional = float(self.exchange.get_min_notional(symbol))
+            except Exception:
+                min_notional = 0.0
+
+            if min_notional > 0 and quote_amount < min_notional:
+                msg = (
+                    f"EXEC_REJECT | MIN_NOTIONAL | id={signal_id} symbol={symbol} "
+                    f"quote={quote_amount:.8f} < min_notional={min_notional}"
+                )
+                logger.warning(msg)
+                log_event("EXEC_REJECT_MIN_NOTIONAL", msg)
+                # mark as executed to avoid endless retries / spam
+                mark_signal_id_executed(
+                    signal_id,
+                    signal_hash=signal_hash,
+                    action="REJECT_MIN_NOTIONAL",
+                    symbol=str(symbol),
+                )
+                return
+
             # ✅ last-millisecond kill switch
             if is_kill_switch_active():
                 logger.error(f"KILL_SWITCH_ACTIVE_LAST_GATE | BUY_BLOCKED | id={signal_id}")
