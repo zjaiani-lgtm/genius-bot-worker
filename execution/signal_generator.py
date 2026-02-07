@@ -17,7 +17,9 @@ CANDLE_LIMIT = int(os.getenv("BOT_CANDLE_LIMIT", "50"))
 COOLDOWN_SECONDS = int(os.getenv("BOT_SIGNAL_COOLDOWN_SECONDS", "60"))
 
 ALLOW_LIVE_SIGNALS = os.getenv("ALLOW_LIVE_SIGNALS", "false").lower() == "true"
-POSITION_SIZE = float(os.getenv("BOT_POSITION_SIZE", "0.0001"))
+# Trade sizing is controlled in QUOTE currency (USDT) to avoid Binance NOTIONAL filter failures.
+# This value is used to compute base_amount = quote_amount / last_price at signal creation time.
+BOT_QUOTE_PER_TRADE = float(os.getenv("BOT_QUOTE_PER_TRADE", "15"))  # USDT per trade
 CONFIDENCE = float(os.getenv("BOT_SIGNAL_CONFIDENCE", "0.55"))
 
 GEN_DEBUG = os.getenv("GEN_DEBUG", "true").lower() == "true"
@@ -124,6 +126,10 @@ def generate_signal() -> Optional[Dict[str, Any]]:
         mode_allowed = {"demo": True, "live": bool(ALLOW_LIVE_SIGNALS)}
         signal_id = f"GBM-AUTO-{uuid.uuid4().hex}"
 
+        # Compute base size from quote amount (USDT) to keep notional consistent across symbols.
+        quote_amount = float(BOT_QUOTE_PER_TRADE)
+        base_amount = quote_amount / float(last) if float(last) > 0 else 0.0
+
         sig = {
             "signal_id": signal_id,
             "timestamp_utc": _now_utc_iso(),
@@ -135,7 +141,8 @@ def generate_signal() -> Optional[Dict[str, Any]]:
                 "symbol": symbol,
                 "direction": "LONG",
                 "entry": {"type": "MARKET", "price": None},
-                "position_size": POSITION_SIZE,
+                "position_size": base_amount,
+                "quote_amount": quote_amount,
                 "risk": {"stop_loss": None, "take_profit": None},
             },
         }
@@ -143,7 +150,7 @@ def generate_signal() -> Optional[Dict[str, Any]]:
         if GEN_DEBUG:
             logger.info(
                 f"[GEN] SIGNAL_READY | id={signal_id} verdict=TRADE symbol={symbol} dir=LONG "
-                f"mode_allowed={mode_allowed} pos_size={POSITION_SIZE}"
+                f"mode_allowed={mode_allowed} quote_amount={quote_amount} base_size={base_amount}"
             )
 
         return sig
