@@ -153,7 +153,7 @@ class ExecutionEngine:
 
         logger.info(f"EXEC_ENTER | id={signal_id} verdict={verdict} MODE={self.mode} ENV_KILL_SWITCH={self.env_kill_switch}")
 
-        # ✅ IDEMPOTENCY: dedupe by signal_id
+        # ✅ IDEMPOTENCY
         try:
             if signal_id_already_executed(signal_id):
                 logger.warning(f"EXEC_DEDUPED | duplicate ignored | id={signal_id}")
@@ -222,13 +222,16 @@ class ExecutionEngine:
             logger.warning(f"EXEC_BLOCKED | exchange client not wired | id={signal_id}")
             return
 
+        # import these here (avoid circular)
+        from execution.exchange_client import LiveTradingBlocked
+
         try:
             if quote_amount is None:
                 last = self.exchange.fetch_last_price(symbol)
                 quote_amount = float(position_size) * float(last)
             quote_amount = float(quote_amount)
 
-            # ✅ Binance NOTIONAL gate (prevents -1013 Filter failure: NOTIONAL)
+            # ✅ Binance NOTIONAL gate
             min_notional = 0.0
             try:
                 min_notional = float(self.exchange.get_min_notional(symbol))
@@ -242,13 +245,7 @@ class ExecutionEngine:
                 )
                 logger.warning(msg)
                 log_event("EXEC_REJECT_MIN_NOTIONAL", msg)
-                # mark as executed to avoid endless retries / spam
-                mark_signal_id_executed(
-                    signal_id,
-                    signal_hash=signal_hash,
-                    action="REJECT_MIN_NOTIONAL",
-                    symbol=str(symbol),
-                )
+                mark_signal_id_executed(signal_id, signal_hash=signal_hash, action="REJECT_MIN_NOTIONAL", symbol=str(symbol))
                 return
 
             # ✅ last-millisecond kill switch
@@ -264,7 +261,6 @@ class ExecutionEngine:
             logger.info(f"EXEC_LIVE_BUY_OK | id={signal_id} symbol={symbol} quote={quote_amount} avg={buy_avg} order_id={buy.get('id')}")
             log_event("TRADE_EXECUTED", f"{signal_id} LIVE BUY {symbol} quote={quote_amount} avg={buy_avg} order_id={buy.get('id')}")
 
-            # ✅ mark executed right after BUY (prevents double-buy)
             mark_signal_id_executed(signal_id, signal_hash=signal_hash, action="TRADE_LIVE_BUY", symbol=str(symbol))
 
             base_asset = symbol.split("/")[0].upper()
@@ -312,20 +308,17 @@ class ExecutionEngine:
             def _otype(rep):
                 return str(rep.get("type") or rep.get("orderType") or "").upper()
 
-            # ✅ FIX: STOP_LOSS_LIMIT contains "STOP" so it's SL
             for rep in order_reports:
                 oid = rep.get("orderId") or rep.get("order_id")
                 if not oid:
                     continue
                 oid = str(oid)
                 typ = _otype(rep)
-
                 if "STOP" in typ:
                     sl_order_id = sl_order_id or oid
                 else:
                     tp_order_id = tp_order_id or oid
 
-            # fallback: raw["orders"]
             orders = raw.get("orders") or []
             if (not tp_order_id or not sl_order_id) and len(orders) >= 2:
                 ids = []
@@ -346,7 +339,6 @@ class ExecutionEngine:
             logger.info(f"OCO_OK | id={signal_id} listOrderId={list_order_id} tp={tp_order_id} sl={sl_order_id}")
             log_event("OCO_ARMED", f"{signal_id} symbol={symbol} listOrderId={list_order_id} tp={tp_order_id} sl={sl_order_id} amount={sell_amount}")
 
-            # ✅ FAILSAFE: must be valid
             if (not list_order_id) or (not tp_order_id) or (not sl_order_id) or (str(tp_order_id) == str(sl_order_id)):
                 msg = (
                     f"OCO_INVALID | id={signal_id} symbol={symbol} "
@@ -373,6 +365,15 @@ class ExecutionEngine:
             )
 
             log_event("TRADE_LIVE_ARMED", f"{signal_id} {symbol} OCO_ARMED listOrderId={list_order_id}")
+
+        except LiveTradingBlocked as e:
+            # ✅ This is a controlled safety block, not a crash.
+            msg = f"EXEC_REJECT | LIVE_BLOCKED | id={signal_id} reason={e}"
+            logger.warning(msg)
+            log_event("EXEC_REJECT_LIVE_BLOCKED", msg)
+            # ✅ Mark to prevent endless retry spam
+            mark_signal_id_executed(signal_id, signal_hash=signal_hash, action="REJECT_LIVE_BLOCKED", symbol=str(symbol))
+            return
 
         except Exception as e:
             logger.exception(f"EXEC_LIVE_ERROR | id={signal_id} err={e}")
