@@ -90,6 +90,38 @@ class BinanceSpotClient:
         t = self.exchange.fetch_ticker(symbol)
         return float(t["last"])
 
+    def get_min_notional(self, symbol: str) -> float:
+        """Return minimum notional (quote value) required for an order on this symbol.
+
+        Binance may reject market orders if the quote value is below MIN_NOTIONAL/NOTIONAL filter.
+        We try multiple sources (ccxt limits then raw exchange filters) and return 0.0 if unknown.
+        """
+        try:
+            m = self.exchange.market(symbol)
+
+            # 1) ccxt normalized limits (if available)
+            cost_min = (((m.get("limits") or {}).get("cost") or {}).get("min"))
+            if cost_min is not None:
+                return float(cost_min)
+
+            # 2) raw Binance filters
+            info = m.get("info") or {}
+            filters = info.get("filters") or []
+            for f in filters:
+                t = str(f.get("filterType") or "").upper()
+                if t in ("MIN_NOTIONAL", "NOTIONAL"):
+                    v = f.get("minNotional")
+                    if v is None:
+                        v = f.get("minNotionalValue")
+                    if v is None:
+                        v = f.get("notional")
+                    if v is not None:
+                        return float(v)
+        except Exception as e:
+            logger.warning(f"MIN_NOTIONAL_LOOKUP_FAIL | symbol={symbol} err={e}")
+
+        return 0.0
+
     def fetch_balance_free(self, asset: str) -> float:
         bal = self.exchange.fetch_balance()
         return float((bal.get("free", {}) or {}).get(asset.upper(), 0.0) or 0.0)
