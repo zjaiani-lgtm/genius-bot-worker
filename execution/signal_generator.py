@@ -12,20 +12,26 @@ from execution.db.repository import has_active_oco_for_symbol
 
 logger = logging.getLogger("gbm")
 
-TIMEFRAME = os.getenv("BOT_TIMEFRAME", "1m")
+TIMEFRAME = os.getenv("BOT_TIMEFRAME", "15m")
 CANDLE_LIMIT = int(os.getenv("BOT_CANDLE_LIMIT", "50"))
-COOLDOWN_SECONDS = int(os.getenv("BOT_SIGNAL_COOLDOWN_SECONDS", "60"))
+COOLDOWN_SECONDS = int(os.getenv("BOT_SIGNAL_COOLDOWN_SECONDS", "180"))
 
 ALLOW_LIVE_SIGNALS = os.getenv("ALLOW_LIVE_SIGNALS", "false").lower() == "true"
-# Trade sizing is controlled in QUOTE currency (USDT) to avoid Binance NOTIONAL filter failures.
-# This value is used to compute base_amount = quote_amount / last_price at signal creation time.
-BOT_QUOTE_PER_TRADE = float(os.getenv("BOT_QUOTE_PER_TRADE", "15"))  # USDT per trade
+
+# USDT per trade (prevents NOTIONAL issues & keeps sizing consistent across symbols)
+BOT_QUOTE_PER_TRADE = float(os.getenv("BOT_QUOTE_PER_TRADE", "15"))
+
 CONFIDENCE = float(os.getenv("BOT_SIGNAL_CONFIDENCE", "0.55"))
+BLOCK_SIGNALS_WHEN_ACTIVE_OCO = os.getenv("BLOCK_SIGNALS_WHEN_ACTIVE_OCO", "true").lower() == "true"
 
 GEN_DEBUG = os.getenv("GEN_DEBUG", "true").lower() == "true"
 GEN_LOG_EVERY_TICK = os.getenv("GEN_LOG_EVERY_TICK", "true").lower() == "true"
 
-BLOCK_SIGNALS_WHEN_ACTIVE_OCO = os.getenv("BLOCK_SIGNALS_WHEN_ACTIVE_OCO", "true").lower() == "true"
+# ✅ Chop / volatility gates (NEW)
+# 1) Minimum percent move (range) over last 20 candles
+MIN_MOVE_PCT = float(os.getenv("MIN_MOVE_PCT", "0.35"))  # %
+# 2) Price must be at least this % above MA20 to avoid micro-cross noise
+MA_GAP_PCT = float(os.getenv("MA_GAP_PCT", "0.12"))  # %
 
 _last_emit_ts: float = 0.0
 _last_signature: Optional[Tuple[str, str]] = None
@@ -38,12 +44,6 @@ def _now_utc_iso() -> str:
 
 
 def _parse_symbols() -> List[str]:
-    """
-    Priority:
-      1) BOT_SYMBOLS (comma-separated)
-      2) SYMBOL_WHITELIST (comma-separated)
-      3) BOT_SYMBOL (single)
-    """
     raw = os.getenv("BOT_SYMBOLS", "").strip()
     if not raw:
         raw = os.getenv("SYMBOL_WHITELIST", "").strip()
@@ -66,18 +66,19 @@ def _has_active_oco(symbol: str) -> bool:
     try:
         return has_active_oco_for_symbol(symbol)
     except Exception as e:
-        # უსაფრთხო მიდგომა: თუ ვერ ვამოწმებთ DB-ს, ვთვლით რომ active_oco=True და არ ვამატებთ ახალ სიგნალს ამ სიმბოლოზე
+        # safe default: assume active_oco to avoid opening uncontrolled trades
         logger.warning(f"[GEN] ACTIVE_OCO_CHECK_FAIL | symbol={symbol} err={e} -> assume active_oco=True")
         return True
 
 
+def _pct(a: float, b: float) -> float:
+    # percent change from b -> a
+    if b == 0:
+        return 0.0
+    return (a - b) / b * 100.0
+
+
 def generate_signal() -> Optional[Dict[str, Any]]:
-    """
-    Multi-symbol scan:
-      - გადაუვლის SYMBOLS სიას
-      - თუ BLOCK_SIGNALS_WHEN_ACTIVE_OCO=True, აქტიური OCO მქონე symbol-ს გამოტოვებს
-      - პირველი დადებითი პირობების ქოინზე დააბრუნებს TRADE სიგნალს
-    """
     for symbol in SYMBOLS:
         if BLOCK_SIGNALS_WHEN_ACTIVE_OCO and _has_active_oco(symbol):
             if GEN_DEBUG:
@@ -99,34 +100,50 @@ def generate_signal() -> Optional[Dict[str, Any]]:
                 logger.info(f"[GEN] NO_SIGNAL | symbol={symbol} reason=not_enough_candles got={len(ohlcv) if ohlcv else 0} need>=25")
             continue
 
-        closes = [c[4] for c in ohlcv]
+        closes = [float(c[4]) for c in ohlcv]
         last = float(closes[-1])
         prev = float(closes[-2])
         ma20 = float(sum(closes[-20:]) / 20.0)
 
+        # Core conditions
         cond_ma = last > ma20
         cond_mom = last > prev
+
+        # ✅ NEW gate 1: ensure there is real movement (avoid chop)
+        window = closes[-20:]
+        hi = max(window)
+        lo = min(window)
+        move_pct = _pct(hi, lo)  # range % over window
+        cond_move = move_pct >= MIN_MOVE_PCT
+
+        # ✅ NEW gate 2: require real separation above MA20
+        ma_gap_pct = _pct(last, ma20)
+        cond_gap = ma_gap_pct >= MA_GAP_PCT
 
         if GEN_LOG_EVERY_TICK:
             logger.info(
                 f"[GEN] SNAPSHOT | symbol={symbol} last={last:.2f} prev={prev:.2f} ma20={ma20:.2f} "
-                f"cond(last>ma20)={cond_ma} cond(last>prev)={cond_mom}"
+                f"move20={move_pct:.2f}% ma_gap={ma_gap_pct:.2f}% "
+                f"cond(last>ma20)={cond_ma} cond(last>prev)={cond_mom} cond(move>={MIN_MOVE_PCT})={cond_move} cond(gap>={MA_GAP_PCT})={cond_gap}"
             )
 
-        if not (cond_ma and cond_mom):
+        if not (cond_ma and cond_mom and cond_move and cond_gap):
             if GEN_LOG_EVERY_TICK:
                 reason = []
                 if not cond_ma:
                     reason.append("last<=ma20")
                 if not cond_mom:
                     reason.append("last<=prev")
-                logger.info(f"[GEN] NO_SIGNAL | symbol={symbol} reason={','.join(reason) if reason else 'unknown'}")
+                if not cond_move:
+                    reason.append(f"move20<{MIN_MOVE_PCT}%")
+                if not cond_gap:
+                    reason.append(f"ma_gap<{MA_GAP_PCT}%")
+                logger.info(f"[GEN] NO_SIGNAL | symbol={symbol} reason={','.join(reason)}")
             continue
 
         mode_allowed = {"demo": True, "live": bool(ALLOW_LIVE_SIGNALS)}
         signal_id = f"GBM-AUTO-{uuid.uuid4().hex}"
 
-        # Compute base size from quote amount (USDT) to keep notional consistent across symbols.
         quote_amount = float(BOT_QUOTE_PER_TRADE)
         base_amount = quote_amount / float(last) if float(last) > 0 else 0.0
 
@@ -159,11 +176,9 @@ def generate_signal() -> Optional[Dict[str, Any]]:
 
 
 def run_once(outbox_path: str) -> bool:
-    """IMPORTANT: must exist at module top-level for import in main.py"""
     global _last_emit_ts, _last_signature
 
     now = time.time()
-
     elapsed = now - _last_emit_ts
     if elapsed < COOLDOWN_SECONDS:
         if GEN_DEBUG:
@@ -177,13 +192,6 @@ def run_once(outbox_path: str) -> bool:
     symbol = (sig.get("execution") or {}).get("symbol")
     direction = (sig.get("execution") or {}).get("direction")
     signature = (str(symbol), str(direction))
-
-    # სურვილის შემთხვევაში dedupe შეგიძლია ჩართო.
-    # if _last_signature == signature:
-    #     _last_emit_ts = now
-    #     if GEN_DEBUG:
-    #         logger.info(f"[GEN] SKIP | dedupe_hit signature={signature}")
-    #     return False
 
     try:
         append_signal(sig, outbox_path)
