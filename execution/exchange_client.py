@@ -172,6 +172,15 @@ class BinanceSpotClient:
         except Exception as e:
             raise ExchangeClientError(f"Market buy failed: {e}")
 
+    def place_market_sell(self, symbol: str, base_amount: float) -> Dict[str, Any]:
+        """Market sell by base amount."""
+        self._guard(symbol)
+        try:
+            amt = float(self.exchange.amount_to_precision(symbol, base_amount))
+            return self.exchange.create_order(symbol, "market", "sell", float(amt), None)
+        except Exception as e:
+            raise ExchangeClientError(f"Market sell failed: {e}")
+
     def place_limit_sell_amount(self, symbol: str, base_amount: float, price: float) -> Dict[str, Any]:
         self._guard(symbol)
         try:
