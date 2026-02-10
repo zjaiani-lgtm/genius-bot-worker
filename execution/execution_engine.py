@@ -145,6 +145,105 @@ class ExecutionEngine:
                 logger.warning(f"OCO_RECONCILE_FAIL | link={link_id} symbol={symbol} err={e}")
 
     # ----------------------------
+    # SELL (early exit) execution
+    # ----------------------------
+    def _execute_sell(self, signal_id: str, symbol: str, signal_hash: str = None) -> None:
+        """Close an existing position early.
+
+        Strategy:
+        1) Cancel any ACTIVE OCO orders for this symbol.
+        2) Market sell the available free base balance.
+        3) Mark signal executed to avoid retry loops.
+        """
+        logger.info(f"SELL_ENTER | id={signal_id} symbol={symbol} MODE={self.mode}")
+
+        # DEMO: just log (no wallet state tracking yet)
+        if self.mode == "DEMO":
+            log_event("SELL_DEMO", f"{signal_id} DEMO SELL {symbol}")
+            mark_signal_id_executed(signal_id, signal_hash=signal_hash, action="SELL_DEMO", symbol=str(symbol))
+            return
+
+        if self.exchange is None:
+            log_event("SELL_BLOCKED_NO_EXCHANGE", f"{signal_id} {symbol}")
+            logger.warning(f"SELL_BLOCKED | exchange client not wired | id={signal_id} symbol={symbol}")
+            return
+
+        # last-millisecond kill switch
+        if is_kill_switch_active():
+            logger.error(f"KILL_SWITCH_ACTIVE_LAST_GATE | SELL_BLOCKED | id={signal_id} symbol={symbol}")
+            log_event("SELL_BLOCKED_KILL_SWITCH_LAST_GATE", f"{signal_id} {symbol}")
+            return
+
+        # 1) Cancel active OCO (if any)
+        rows = list_active_oco_links(limit=50)
+        rows = [r for r in rows if str(r[2] or "").upper() == str(symbol).upper()]
+
+        def _norm(s: Any) -> str:
+            return str(s or "").strip().lower()
+
+        CLOSED = {"closed", "filled"}
+
+        for r in rows:
+            link_id, oco_signal_id, sym, base_asset, tp_order_id, sl_order_id, *_rest = r
+
+            # Try to detect if one leg already filled
+            try:
+                tp = self.exchange.fetch_order(tp_order_id, symbol)
+                sl = self.exchange.fetch_order(sl_order_id, symbol)
+                tp_status = _norm(tp.get("status"))
+                sl_status = _norm(sl.get("status"))
+
+                if tp_status in CLOSED:
+                    set_oco_status(link_id, "CLOSED_TP")
+                    log_event("SELL_SKIP", f"{signal_id} {symbol} already closed by TP (link={link_id})")
+                    continue
+                if sl_status in CLOSED:
+                    set_oco_status(link_id, "CLOSED_SL")
+                    log_event("SELL_SKIP", f"{signal_id} {symbol} already closed by SL (link={link_id})")
+                    continue
+
+                # Cancel both legs best-effort
+                for oid in (tp_order_id, sl_order_id):
+                    if not oid:
+                        continue
+                    try:
+                        self.exchange.cancel_order(str(oid), symbol)
+                    except Exception as e:
+                        logger.warning(f"SELL_CANCEL_WARN | id={signal_id} symbol={symbol} order_id={oid} err={e}")
+
+                set_oco_status(link_id, "CANCELED_BY_SIGNAL")
+                log_event("OCO_CANCELED", f"{signal_id} {symbol} link={link_id} canceled_by_signal")
+
+            except Exception as e:
+                logger.warning(f"SELL_OCO_LOOKUP_FAIL | id={signal_id} symbol={symbol} link={link_id} err={e}")
+
+        # 2) Market sell available base
+        base_asset = symbol.split("/")[0].upper()
+        free_base = float(self.exchange.fetch_balance_free(base_asset))
+        sell_amount = self.exchange.floor_amount(symbol, free_base * self.sell_buffer)
+        if sell_amount <= 0:
+            sell_amount = self.exchange.floor_amount(symbol, free_base * self.sell_retry_buffer)
+
+        if sell_amount <= 0:
+            msg = f"SELL_SKIP_NO_FREE_BASE | id={signal_id} symbol={symbol} free_{base_asset}={free_base}"
+            logger.warning(msg)
+            log_event("SELL_SKIP_NO_FREE_BASE", msg)
+            mark_signal_id_executed(signal_id, signal_hash=signal_hash, action="SELL_NO_FREE_BASE", symbol=str(symbol))
+            return
+
+        try:
+            sell = self.exchange.place_market_sell(symbol=symbol, base_amount=sell_amount)
+            avg = float(sell.get("average") or sell.get("price") or 0.0) or self.exchange.fetch_last_price(symbol)
+            logger.info(f"SELL_LIVE_OK | id={signal_id} symbol={symbol} amount={sell_amount} avg={avg} order_id={sell.get('id')}")
+            log_event("SELL_LIVE_OK", f"{signal_id} {symbol} amount={sell_amount} avg={avg} order_id={sell.get('id')}")
+            mark_signal_id_executed(signal_id, signal_hash=signal_hash, action="SELL_LIVE", symbol=str(symbol))
+        except Exception as e:
+            logger.exception(f"SELL_LIVE_ERROR | id={signal_id} symbol={symbol} err={e}")
+            log_event("SELL_LIVE_ERROR", f"{signal_id} {symbol} err={e}")
+            # Do not mark executed on hard error: allow retry if signal repeats
+            return
+
+    # ----------------------------
     # Main execution
     # ----------------------------
     def execute_signal(self, signal: Dict[str, Any]) -> None:
@@ -196,6 +295,19 @@ class ExecutionEngine:
 
         position_size = execution.get("position_size")
         quote_amount = execution.get("quote_amount")
+
+        # ----------------------------
+        # SELL (early exit) handling
+        # ----------------------------
+        if verdict == "SELL":
+            if not symbol or direction != "LONG":
+                logger.warning(f"EXEC_REJECT | bad SELL payload | id={signal_id} symbol={symbol} dir={direction}")
+                log_event("REJECT_BAD_SELL_PAYLOAD", f"{signal_id} symbol={symbol} dir={direction}")
+                return
+
+            signal_hash = signal.get("_fingerprint") or signal.get("signal_hash")
+            self._execute_sell(signal_id=signal_id, symbol=str(symbol), signal_hash=signal_hash)
+            return
 
         if not symbol or direction != "LONG" or entry_type != "MARKET":
             logger.warning(f"EXEC_REJECT | bad payload | id={signal_id} symbol={symbol} dir={direction} entry={entry_type}")
