@@ -40,7 +40,11 @@ def validate_signal(signal: Dict[str, Any]) -> None:
         raise ValueError("SIGNAL_NOT_DICT")
 
     verdict = str(signal.get("final_verdict") or "").upper().strip()
-    if verdict not in ("TRADE", "HOLD"):
+    # Supported verdicts:
+    # - TRADE: open LONG position (MARKET buy)
+    # - HOLD: no-op
+    # - SELL: close position early (market sell) by canceling active OCO
+    if verdict not in ("TRADE", "HOLD", "SELL"):
         raise ValueError("INVALID_VERDICT")
 
     if signal.get("certified_signal") is not True:
@@ -56,12 +60,16 @@ def validate_signal(signal: Dict[str, Any]) -> None:
         raise ValueError("MISSING_EXEC_SYMBOL")
     if direction != "LONG":
         raise ValueError("INVALID_DIRECTION")
-    if entry_type != "MARKET":
-        raise ValueError("INVALID_ENTRY_TYPE")
+    # For TRADE we require MARKET entry + sizing.
+    # For SELL we only require the symbol + direction. Size is optional (we sell what's free).
+    if verdict == "TRADE":
+        if entry_type != "MARKET":
+            raise ValueError("INVALID_ENTRY_TYPE")
 
-    ps = _safe_float(execution.get("position_size"))
-    if ps is None or ps <= 0:
-        raise ValueError("INVALID_POSITION_SIZE")
+        ps = _safe_float(execution.get("position_size"))
+        qa = _safe_float(execution.get("quote_amount"))
+        if (ps is None or ps <= 0) and (qa is None or qa <= 0):
+            raise ValueError("INVALID_POSITION_SIZE")
 
 
 def _read_outbox(path: str) -> Dict[str, Any]:
