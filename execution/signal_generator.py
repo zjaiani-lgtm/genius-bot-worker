@@ -20,7 +20,7 @@ COOLDOWN_SECONDS = int(os.getenv("BOT_SIGNAL_COOLDOWN_SECONDS", "180"))
 
 ALLOW_LIVE_SIGNALS = os.getenv("ALLOW_LIVE_SIGNALS", "false").lower() == "true"
 
-# USDT per trade
+# USDT per trade (prevents NOTIONAL issues when you size in quote)
 BOT_QUOTE_PER_TRADE = float(os.getenv("BOT_QUOTE_PER_TRADE", "15"))
 
 BLOCK_SIGNALS_WHEN_ACTIVE_OCO = os.getenv("BLOCK_SIGNALS_WHEN_ACTIVE_OCO", "true").lower() == "true"
@@ -31,12 +31,12 @@ GEN_LOG_EVERY_TICK = os.getenv("GEN_LOG_EVERY_TICK", "true").lower() == "true"
 EXCEL_MODEL_PATH = os.getenv("EXCEL_MODEL_PATH", "/var/data/DYZEN_CAPITAL_OS_AI_LIVE_CORE_READY.xlsx")
 
 _last_emit_ts: float = 0.0
-_last_signature: Optional[Tuple[str, str]] = None
+_last_signature: Optional[Tuple[str, str]] = None  # reserved (if you later want de-dup)
 
 EXCHANGE = ccxt.binance({"enableRateLimit": True})
 
 # Load Excel core once
-_CORE = None
+_CORE: Optional[ExcelLiveCore] = None
 
 
 def _core() -> ExcelLiveCore:
@@ -130,7 +130,6 @@ def _structure_ok(closes: List[float]) -> bool:
     last = closes[-1]
     ma20 = _sma(closes, 20)
     prev = closes[-2]
-    # simple "structure": above ma + momentum + last 5 higher than avg last 10
     last5 = closes[-5:]
     last10 = closes[-10:]
     return (last > ma20) and (last > prev) and (sum(last5) / 5.0 > sum(last10) / 10.0)
@@ -159,7 +158,6 @@ def _confidence_score(closes: List[float], ohlcv: List[List[float]]) -> float:
     cond2 = 1.0 if last > prev else 0.0
     cond3 = 1.0 if atrp < 2.0 else 0.0  # avoid extreme
 
-    # weighted blend -> 0..1
     return (0.45 * cond1) + (0.35 * cond2) + (0.20 * cond3)
 
 
@@ -198,11 +196,6 @@ def generate_signal() -> Optional[Dict[str, Any]]:
 
     for symbol in SYMBOLS:
         active_oco = _has_active_oco(symbol)
-
-        # if active OCO and we usually block signals, we still allow protective SELL
-        if active_oco and BLOCK_SIGNALS_WHEN_ACTIVE_OCO is True:
-            # we won't open new trades, but we CAN decide to SELL.
-            pass
 
         try:
             t0 = time.time()
@@ -259,7 +252,8 @@ def generate_signal() -> Optional[Dict[str, Any]]:
             logger.info(
                 f"[GEN] CORE_DECISION | symbol={symbol} "
                 f"ai={decision['ai_score']:.3f} macro={decision['macro_gate']} strat={decision['active_strategy']} "
-                f"final={decision['final_trade_decision']} risk={risk} volReg={vol_reg} atr%={atrp:.2f}"
+                f"final={decision['final_trade_decision']} risk={risk} volReg={vol_reg} atr%={atrp:.2f} "
+                f"last={last:.6f} ma20={ma20:.6f}"
             )
 
         # Protective SELL if active OCO and risk is KILL
@@ -285,12 +279,18 @@ def generate_signal() -> Optional[Dict[str, Any]]:
             _emit(sig, outbox_path)
             return sig
 
-        # If active OCO → we do not open new TRADE
-        if active_oco:
+        # If active OCO → we do not open new TRADE (risk-first)
+        if active_oco and BLOCK_SIGNALS_WHEN_ACTIVE_OCO:
             continue
 
         # TRADE only if final decision says EXECUTE
         if decision["final_trade_decision"] != "EXECUTE":
+            continue
+
+        # Safety: don't emit live trades if not allowed
+        if not ALLOW_LIVE_SIGNALS:
+            if GEN_DEBUG:
+                logger.info(f"[GEN] BLOCKED_BY_ENV | symbol={symbol} reason=ALLOW_LIVE_SIGNALS=false")
             continue
 
         # build TRADE signal
@@ -309,7 +309,7 @@ def generate_signal() -> Optional[Dict[str, Any]]:
                 "symbol": symbol,
                 "direction": "LONG",
                 "entry": {"type": "MARKET"},
-                "quote_amount": BOT_QUOTE_PER_TRADE,  # sizing in USDT (avoids NOTIONAL)
+                "quote_amount": BOT_QUOTE_PER_TRADE,  # size in USDT (helps NOTIONAL)
             }
         }
 
@@ -317,3 +317,16 @@ def generate_signal() -> Optional[Dict[str, Any]]:
         return sig
 
     return None
+
+
+# -----------------------------
+# COMPATIBILITY ENTRYPOINTS
+# -----------------------------
+
+def run_once(*args, **kwargs) -> Optional[Dict[str, Any]]:
+    """
+    Backwards-compatible entrypoint expected by bootstrap:
+    some versions do: `from execution.signal_generator import run_once`.
+    We ignore args/kwargs intentionally.
+    """
+    return generate_signal()
