@@ -1,3 +1,4 @@
+# execution/signal_generator.py
 import os
 import time
 import uuid
@@ -9,34 +10,41 @@ import ccxt
 
 from execution.signal_client import append_signal
 from execution.db.repository import has_active_oco_for_symbol
+from execution.excel_live_core import ExcelLiveCore, CoreInputs
 
 logger = logging.getLogger("gbm")
 
 TIMEFRAME = os.getenv("BOT_TIMEFRAME", "15m")
-CANDLE_LIMIT = int(os.getenv("BOT_CANDLE_LIMIT", "50"))
+CANDLE_LIMIT = int(os.getenv("BOT_CANDLE_LIMIT", "80"))
 COOLDOWN_SECONDS = int(os.getenv("BOT_SIGNAL_COOLDOWN_SECONDS", "180"))
 
 ALLOW_LIVE_SIGNALS = os.getenv("ALLOW_LIVE_SIGNALS", "false").lower() == "true"
 
-# USDT per trade (prevents NOTIONAL issues & keeps sizing consistent across symbols)
+# USDT per trade
 BOT_QUOTE_PER_TRADE = float(os.getenv("BOT_QUOTE_PER_TRADE", "15"))
 
-CONFIDENCE = float(os.getenv("BOT_SIGNAL_CONFIDENCE", "0.55"))
 BLOCK_SIGNALS_WHEN_ACTIVE_OCO = os.getenv("BLOCK_SIGNALS_WHEN_ACTIVE_OCO", "true").lower() == "true"
 
 GEN_DEBUG = os.getenv("GEN_DEBUG", "true").lower() == "true"
 GEN_LOG_EVERY_TICK = os.getenv("GEN_LOG_EVERY_TICK", "true").lower() == "true"
 
-# ✅ Chop / volatility gates (NEW)
-# 1) Minimum percent move (range) over last 20 candles
-MIN_MOVE_PCT = float(os.getenv("MIN_MOVE_PCT", "0.35"))  # %
-# 2) Price must be at least this % above MA20 to avoid micro-cross noise
-MA_GAP_PCT = float(os.getenv("MA_GAP_PCT", "0.12"))  # %
+EXCEL_MODEL_PATH = os.getenv("EXCEL_MODEL_PATH", "/var/data/DYZEN_CAPITAL_OS_AI_LIVE_CORE_READY.xlsx")
 
 _last_emit_ts: float = 0.0
 _last_signature: Optional[Tuple[str, str]] = None
 
 EXCHANGE = ccxt.binance({"enableRateLimit": True})
+
+# Load Excel core once
+_CORE = None
+
+
+def _core() -> ExcelLiveCore:
+    global _CORE
+    if _CORE is None:
+        _CORE = ExcelLiveCore(EXCEL_MODEL_PATH)
+        logger.info(f"[GEN] EXCEL_CORE_LOADED | path={EXCEL_MODEL_PATH}")
+    return _CORE
 
 
 def _now_utc_iso() -> str:
@@ -66,24 +74,135 @@ def _has_active_oco(symbol: str) -> bool:
     try:
         return has_active_oco_for_symbol(symbol)
     except Exception as e:
-        # safe default: assume active_oco to avoid opening uncontrolled trades
+        # safe default: assume active_oco to avoid uncontrolled trades
         logger.warning(f"[GEN] ACTIVE_OCO_CHECK_FAIL | symbol={symbol} err={e} -> assume active_oco=True")
         return True
 
 
 def _pct(a: float, b: float) -> float:
-    # percent change from b -> a
     if b == 0:
         return 0.0
     return (a - b) / b * 100.0
 
 
+def _sma(vals: List[float], n: int) -> float:
+    if len(vals) < n:
+        return sum(vals) / max(1, len(vals))
+    w = vals[-n:]
+    return sum(w) / n
+
+
+def _atr_pct(ohlcv: List[List[float]], n: int = 14) -> float:
+    if len(ohlcv) < n + 1:
+        return 0.0
+    trs = []
+    for i in range(-n, 0):
+        high = float(ohlcv[i][2])
+        low = float(ohlcv[i][3])
+        prev_close = float(ohlcv[i - 1][4])
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        trs.append(tr)
+    atr = sum(trs) / n
+    last_close = float(ohlcv[-1][4])
+    return (atr / last_close) * 100.0 if last_close else 0.0
+
+
+def _vol_regime(atr_pct: float) -> str:
+    # tweakable but sane defaults:
+    if atr_pct >= 2.0:
+        return "EXTREME"
+    if atr_pct <= 0.30:
+        return "LOW"
+    return "NORMAL"
+
+
+def _trend_strength(last: float, ma20: float) -> float:
+    # normalize separation above MA20 into 0..1
+    gap_pct = _pct(last, ma20)  # last vs ma20
+    # map: 0% -> 0.5, 0.4% -> ~0.7, 1% -> ~0.9
+    x = (gap_pct / 1.0)  # 1% scale
+    return max(0.0, min(1.0, 0.5 + (x * 0.4)))
+
+
+def _structure_ok(closes: List[float]) -> bool:
+    if len(closes) < 10:
+        return False
+    last = closes[-1]
+    ma20 = _sma(closes, 20)
+    prev = closes[-2]
+    # simple "structure": above ma + momentum + last 5 higher than avg last 10
+    last5 = closes[-5:]
+    last10 = closes[-10:]
+    return (last > ma20) and (last > prev) and (sum(last5) / 5.0 > sum(last10) / 10.0)
+
+
+def _volume_score(vols: List[float]) -> float:
+    if len(vols) < 20:
+        return 0.0
+    v_last = vols[-1]
+    v_avg = sum(vols[-20:]) / 20.0
+    if v_avg <= 0:
+        return 0.0
+    ratio = v_last / v_avg  # 1.0 is normal
+    # normalize: 0..2 mapped to 0..1
+    return max(0.0, min(1.0, ratio / 2.0))
+
+
+def _confidence_score(closes: List[float], ohlcv: List[List[float]]) -> float:
+    # confidence combines trend alignment + momentum + volatility sanity
+    last = closes[-1]
+    prev = closes[-2]
+    ma20 = _sma(closes, 20)
+    atrp = _atr_pct(ohlcv, 14)
+
+    cond1 = 1.0 if last > ma20 else 0.0
+    cond2 = 1.0 if last > prev else 0.0
+    cond3 = 1.0 if atrp < 2.0 else 0.0  # avoid extreme
+
+    # weighted blend -> 0..1
+    return (0.45 * cond1) + (0.35 * cond2) + (0.20 * cond3)
+
+
+def _risk_state(vol_regime: str, ai_score: float) -> str:
+    # minimal protective logic:
+    if vol_regime == "EXTREME":
+        return "KILL"
+    if ai_score < 0.45:
+        return "REDUCE"
+    return "OK"
+
+
+def _cooldown_ok() -> bool:
+    global _last_emit_ts
+    return (time.time() - _last_emit_ts) >= COOLDOWN_SECONDS
+
+
+def _emit(signal: Dict[str, Any], outbox_path: str) -> None:
+    global _last_emit_ts
+    append_signal(signal, outbox_path)
+    _last_emit_ts = time.time()
+
+
 def generate_signal() -> Optional[Dict[str, Any]]:
+    """
+    Excel Live Core based generator:
+    - If no active OCO: emits TRADE only when final_trade_decision == EXECUTE.
+    - If active OCO: can emit SELL if risk_state == KILL (protective override).
+    """
+    outbox_path = os.getenv("OUTBOX_PATH", "/var/data/signal_outbox.json")
+
+    if not _cooldown_ok():
+        return None
+
+    core = _core()
+
     for symbol in SYMBOLS:
-        if BLOCK_SIGNALS_WHEN_ACTIVE_OCO and _has_active_oco(symbol):
-            if GEN_DEBUG:
-                logger.info(f"[GEN] SKIP_SYMBOL | symbol={symbol} reason=active_oco=True")
-            continue
+        active_oco = _has_active_oco(symbol)
+
+        # if active OCO and we usually block signals, we still allow protective SELL
+        if active_oco and BLOCK_SIGNALS_WHEN_ACTIVE_OCO is True:
+            # we won't open new trades, but we CAN decide to SELL.
+            pass
 
         try:
             t0 = time.time()
@@ -95,111 +214,106 @@ def generate_signal() -> Optional[Dict[str, Any]]:
             logger.exception(f"[GEN] FETCH_FAIL | symbol={symbol} tf={TIMEFRAME} err={e}")
             continue
 
-        if not ohlcv or len(ohlcv) < 25:
+        if not ohlcv or len(ohlcv) < 30:
             if GEN_LOG_EVERY_TICK:
-                logger.info(f"[GEN] NO_SIGNAL | symbol={symbol} reason=not_enough_candles got={len(ohlcv) if ohlcv else 0} need>=25")
+                logger.info(f"[GEN] NO_SIGNAL | symbol={symbol} reason=not_enough_candles got={len(ohlcv) if ohlcv else 0} need>=30")
             continue
 
         closes = [float(c[4]) for c in ohlcv]
-        last = float(closes[-1])
-        prev = float(closes[-2])
-        ma20 = float(sum(closes[-20:]) / 20.0)
+        vols = [float(c[5]) for c in ohlcv]
+        last = closes[-1]
+        ma20 = _sma(closes, 20)
+        atrp = _atr_pct(ohlcv, 14)
+        vol_reg = _vol_regime(atrp)
 
-        # Core conditions
-        cond_ma = last > ma20
-        cond_mom = last > prev
+        trend = _trend_strength(last, ma20)
+        struct_ok = _structure_ok(closes)
+        vol_score = _volume_score(vols)
+        conf = _confidence_score(closes, ohlcv)
 
-        # ✅ NEW gate 1: ensure there is real movement (avoid chop)
-        window = closes[-20:]
-        hi = max(window)
-        lo = min(window)
-        move_pct = _pct(hi, lo)  # range % over window
-        cond_move = move_pct >= MIN_MOVE_PCT
+        # First pass ai_score without risk (risk uses ai_score)
+        tmp_inp = CoreInputs(
+            trend_strength=trend,
+            structure_ok=struct_ok,
+            volume_score=vol_score,
+            risk_state="OK",
+            confidence_score=conf,
+            volatility_regime=vol_reg,
+        )
+        tmp_dec = core.decide(tmp_inp)
+        ai_score = float(tmp_dec["ai_score"])
 
-        # ✅ NEW gate 2: require real separation above MA20
-        ma_gap_pct = _pct(last, ma20)
-        cond_gap = ma_gap_pct >= MA_GAP_PCT
+        risk = _risk_state(vol_reg, ai_score)
 
-        if GEN_LOG_EVERY_TICK:
+        inp = CoreInputs(
+            trend_strength=trend,
+            structure_ok=struct_ok,
+            volume_score=vol_score,
+            risk_state=risk,
+            confidence_score=conf,
+            volatility_regime=vol_reg,
+        )
+        decision = core.decide(inp)
+
+        if GEN_DEBUG:
             logger.info(
-                f"[GEN] SNAPSHOT | symbol={symbol} last={last:.2f} prev={prev:.2f} ma20={ma20:.2f} "
-                f"move20={move_pct:.2f}% ma_gap={ma_gap_pct:.2f}% "
-                f"cond(last>ma20)={cond_ma} cond(last>prev)={cond_mom} cond(move>={MIN_MOVE_PCT})={cond_move} cond(gap>={MA_GAP_PCT})={cond_gap}"
+                f"[GEN] CORE_DECISION | symbol={symbol} "
+                f"ai={decision['ai_score']:.3f} macro={decision['macro_gate']} strat={decision['active_strategy']} "
+                f"final={decision['final_trade_decision']} risk={risk} volReg={vol_reg} atr%={atrp:.2f}"
             )
 
-        if not (cond_ma and cond_mom and cond_move and cond_gap):
-            if GEN_LOG_EVERY_TICK:
-                reason = []
-                if not cond_ma:
-                    reason.append("last<=ma20")
-                if not cond_mom:
-                    reason.append("last<=prev")
-                if not cond_move:
-                    reason.append(f"move20<{MIN_MOVE_PCT}%")
-                if not cond_gap:
-                    reason.append(f"ma_gap<{MA_GAP_PCT}%")
-                logger.info(f"[GEN] NO_SIGNAL | symbol={symbol} reason={','.join(reason)}")
+        # Protective SELL if active OCO and risk is KILL
+        if active_oco and risk == "KILL":
+            signal_id = str(uuid.uuid4())
+            sig = {
+                "signal_id": signal_id,
+                "ts_utc": _now_utc_iso(),
+                "certified_signal": True,
+                "final_verdict": "SELL",
+                "meta": {
+                    "source": "DYZEN_EXCEL_LIVE_CORE",
+                    "symbol": symbol,
+                    "reason": "RISK_KILL_OVERRIDE",
+                    "decision": decision,
+                },
+                "execution": {
+                    "symbol": symbol,
+                    "direction": "LONG",
+                    "entry": {"type": "MARKET"},
+                }
+            }
+            _emit(sig, outbox_path)
+            return sig
+
+        # If active OCO → we do not open new TRADE
+        if active_oco:
             continue
 
-        mode_allowed = {"demo": True, "live": bool(ALLOW_LIVE_SIGNALS)}
-        signal_id = f"GBM-AUTO-{uuid.uuid4().hex}"
+        # TRADE only if final decision says EXECUTE
+        if decision["final_trade_decision"] != "EXECUTE":
+            continue
 
-        quote_amount = float(BOT_QUOTE_PER_TRADE)
-        base_amount = quote_amount / float(last) if float(last) > 0 else 0.0
-
+        # build TRADE signal
+        signal_id = str(uuid.uuid4())
         sig = {
             "signal_id": signal_id,
-            "timestamp_utc": _now_utc_iso(),
-            "final_verdict": "TRADE",
+            "ts_utc": _now_utc_iso(),
             "certified_signal": True,
-            "confidence": CONFIDENCE,
-            "mode_allowed": mode_allowed,
+            "final_verdict": "TRADE",
+            "meta": {
+                "source": "DYZEN_EXCEL_LIVE_CORE",
+                "symbol": symbol,
+                "decision": decision,
+            },
             "execution": {
                 "symbol": symbol,
                 "direction": "LONG",
-                "entry": {"type": "MARKET", "price": None},
-                "position_size": base_amount,
-                "quote_amount": quote_amount,
-                "risk": {"stop_loss": None, "take_profit": None},
-            },
+                "entry": {"type": "MARKET"},
+                "quote_amount": BOT_QUOTE_PER_TRADE,  # sizing in USDT (avoids NOTIONAL)
+            }
         }
 
-        if GEN_DEBUG:
-            logger.info(
-                f"[GEN] SIGNAL_READY | id={signal_id} verdict=TRADE symbol={symbol} dir=LONG "
-                f"mode_allowed={mode_allowed} quote_amount={quote_amount} base_size={base_amount}"
-            )
-
+        _emit(sig, outbox_path)
         return sig
 
     return None
-
-
-def run_once(outbox_path: str) -> bool:
-    global _last_emit_ts, _last_signature
-
-    now = time.time()
-    elapsed = now - _last_emit_ts
-    if elapsed < COOLDOWN_SECONDS:
-        if GEN_DEBUG:
-            logger.info(f"[GEN] SKIP | cooldown_active left~{int(COOLDOWN_SECONDS - elapsed)}s")
-        return False
-
-    sig = generate_signal()
-    if not sig:
-        return False
-
-    symbol = (sig.get("execution") or {}).get("symbol")
-    direction = (sig.get("execution") or {}).get("direction")
-    signature = (str(symbol), str(direction))
-
-    try:
-        append_signal(sig, outbox_path)
-        _last_emit_ts = now
-        _last_signature = signature
-        if GEN_DEBUG:
-            logger.info(f"[GEN] OUTBOX_APPEND_OK | path={outbox_path} id={sig.get('signal_id')} signature={signature}")
-        return True
-    except Exception as e:
-        logger.exception(f"[GEN] OUTBOX_APPEND_FAIL | path={outbox_path} err={e}")
-        return False
