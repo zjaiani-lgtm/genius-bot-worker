@@ -18,33 +18,39 @@ TIMEFRAME = os.getenv("BOT_TIMEFRAME", "15m")
 CANDLE_LIMIT = int(os.getenv("BOT_CANDLE_LIMIT", "80"))
 COOLDOWN_SECONDS = int(os.getenv("BOT_SIGNAL_COOLDOWN_SECONDS", "180"))
 
-ALLOW_LIVE_SIGNALS = os.getenv("ALLOW_LIVE_SIGNALS", "false").lower() == "true"
+ALLOW_LIVE_SIGNALS = os.getenv("ALLOW_LIVE_SIGNALS", "false").strip().lower() == "true"
 
 # USDT per trade (prevents NOTIONAL issues when you size in quote)
 BOT_QUOTE_PER_TRADE = float(os.getenv("BOT_QUOTE_PER_TRADE", "15"))
 
-BLOCK_SIGNALS_WHEN_ACTIVE_OCO = os.getenv("BLOCK_SIGNALS_WHEN_ACTIVE_OCO", "true").lower() == "true"
+BLOCK_SIGNALS_WHEN_ACTIVE_OCO = os.getenv("BLOCK_SIGNALS_WHEN_ACTIVE_OCO", "true").strip().lower() == "true"
 
-GEN_DEBUG = os.getenv("GEN_DEBUG", "true").lower() == "true"
-GEN_LOG_EVERY_TICK = os.getenv("GEN_LOG_EVERY_TICK", "true").lower() == "true"
+GEN_DEBUG = os.getenv("GEN_DEBUG", "true").strip().lower() == "true"
+GEN_LOG_EVERY_TICK = os.getenv("GEN_LOG_EVERY_TICK", "true").strip().lower() == "true"
 
-EXCEL_MODEL_PATH = os.getenv("EXCEL_MODEL_PATH", "/var/data/DYZEN_CAPITAL_OS_AI_LIVE_CORE_READY.xlsx")
+# ---- Excel model path (sanitized) ----
+EXCEL_MODEL_PATH = os.getenv("EXCEL_MODEL_PATH", "/var/data/DYZEN_CAPITAL_OS_AI_LIVE_CORE_READY.xlsx").strip()
+
+# sanitize common misconfig like: EXCEL_MODEL_PATH=EXCEL_MODEL_PATH=/opt/render/...xlsx
+if EXCEL_MODEL_PATH.lower().startswith("excel_model_path="):
+    EXCEL_MODEL_PATH = EXCEL_MODEL_PATH.split("=", 1)[1].strip()
 
 _last_emit_ts: float = 0.0
 _last_signature: Optional[Tuple[str, str]] = None  # reserved (if you later want de-dup)
 
-EXCHANGE = ccxt.binance({"enableRateLimit": True})
+# ---- Exchange (Binance) ----
+# For public fetch_ohlcv, keys are not required, but for LIVE execution elsewhere they usually are.
+BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "").strip()
+BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "").strip()
+
+EXCHANGE = ccxt.binance({
+    "enableRateLimit": True,
+    "apiKey": BINANCE_API_KEY,
+    "secret": BINANCE_API_SECRET,
+})
 
 # Load Excel core once
 _CORE: Optional[ExcelLiveCore] = None
-
-
-def _core() -> ExcelLiveCore:
-    global _CORE
-    if _CORE is None:
-        _CORE = ExcelLiveCore(EXCEL_MODEL_PATH)
-        logger.info(f"[GEN] EXCEL_CORE_LOADED | path={EXCEL_MODEL_PATH}")
-    return _CORE
 
 
 def _now_utc_iso() -> str:
@@ -77,6 +83,53 @@ def _has_active_oco(symbol: str) -> bool:
         # safe default: assume active_oco to avoid uncontrolled trades
         logger.warning(f"[GEN] ACTIVE_OCO_CHECK_FAIL | symbol={symbol} err={e} -> assume active_oco=True")
         return True
+
+
+def _resolve_excel_path(env_path: str) -> str:
+    """
+    Resolve excel file path robustly:
+    - uses env_path if exists
+    - falls back to /var/data and /opt/render assets
+    - provides strong debug context if nothing found
+    """
+    candidates = [
+        env_path,
+        "/var/data/DYZEN_CAPITAL_OS_AI_LIVE_CORE_READY.xlsx",
+        "/opt/render/project/src/assets/DYZEN_CAPITAL_OS_AI_LIVE_CORE_READY.xlsx",
+    ]
+
+    for p in candidates:
+        if p and os.path.exists(p):
+            return p
+
+    # strong debug info
+    try:
+        assets_list = os.listdir("/opt/render/project/src/assets")
+    except Exception:
+        assets_list = []
+
+    try:
+        var_data_list = os.listdir("/var/data")
+    except Exception:
+        var_data_list = []
+
+    raise FileNotFoundError(
+        f"EXCEL_MODEL_NOT_FOUND | env={env_path} | "
+        f"assets={assets_list} | var_data={var_data_list}"
+    )
+
+
+def _core() -> ExcelLiveCore:
+    global _CORE
+    if _CORE is None:
+        resolved = _resolve_excel_path(EXCEL_MODEL_PATH)
+        logger.info(
+            f"[GEN] EXCEL_PATH | env={EXCEL_MODEL_PATH} resolved={resolved} "
+            f"exists_env={os.path.exists(EXCEL_MODEL_PATH)}"
+        )
+        _CORE = ExcelLiveCore(resolved)
+        logger.info(f"[GEN] EXCEL_CORE_LOADED | path={resolved}")
+    return _CORE
 
 
 def _pct(a: float, b: float) -> float:
@@ -181,13 +234,22 @@ def _emit(signal: Dict[str, Any], outbox_path: str) -> None:
     _last_emit_ts = time.time()
 
 
+def _get_outbox_path() -> str:
+    # supports both env names
+    return (
+        os.getenv("OUTBOX_PATH")
+        or os.getenv("SIGNAL_OUTBOX_PATH")
+        or "/var/data/signal_outbox.json"
+    )
+
+
 def generate_signal() -> Optional[Dict[str, Any]]:
     """
     Excel Live Core based generator:
     - If no active OCO: emits TRADE only when final_trade_decision == EXECUTE.
     - If active OCO: can emit SELL if risk_state == KILL (protective override).
     """
-    outbox_path = os.getenv("OUTBOX_PATH", "/var/data/signal_outbox.json")
+    outbox_path = _get_outbox_path()
 
     if not _cooldown_ok():
         return None
@@ -253,7 +315,7 @@ def generate_signal() -> Optional[Dict[str, Any]]:
                 f"[GEN] CORE_DECISION | symbol={symbol} "
                 f"ai={decision['ai_score']:.3f} macro={decision['macro_gate']} strat={decision['active_strategy']} "
                 f"final={decision['final_trade_decision']} risk={risk} volReg={vol_reg} atr%={atrp:.2f} "
-                f"last={last:.6f} ma20={ma20:.6f}"
+                f"last={last:.6f} ma20={ma20:.6f} outbox={outbox_path}"
             )
 
         # Protective SELL if active OCO and risk is KILL
