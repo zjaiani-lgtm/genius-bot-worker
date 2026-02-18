@@ -23,6 +23,29 @@ ALLOW_LIVE_SIGNALS = os.getenv("ALLOW_LIVE_SIGNALS", "false").strip().lower() ==
 # USDT per trade (prevents NOTIONAL issues when you size in quote)
 BOT_QUOTE_PER_TRADE = float(os.getenv("BOT_QUOTE_PER_TRADE", "15"))
 
+# ---- Risk/Edge gates (these were previously only in Render envs, but not enforced in code) ----
+# Minimum ATR% required to even consider entries on this timeframe.
+MIN_MOVE_PCT = float(os.getenv("MIN_MOVE_PCT", "0.60"))
+
+# Minimum absolute distance of price from MA20 (in %) to avoid "chop" entries.
+MA_GAP_PCT = float(os.getenv("MA_GAP_PCT", "0.15"))
+
+# If your core confidence is below this, we skip (extra guard on top of Excel).
+BUY_CONFIDENCE_MIN = float(os.getenv("BUY_CONFIDENCE_MIN", "0.70"))
+
+# Expected round-trip cost model (VERY important for micro-scalps)
+# Example: taker 0.10% in + 0.10% out => 0.20%. If you are mostly maker, reduce this.
+ESTIMATED_ROUNDTRIP_FEE_PCT = float(os.getenv("ESTIMATED_ROUNDTRIP_FEE_PCT", "0.20"))
+
+# Spread + slippage safety buffer (symbol dependent). Keep conservative for LIVE.
+ESTIMATED_SLIPPAGE_PCT = float(os.getenv("ESTIMATED_SLIPPAGE_PCT", "0.15"))
+
+# Strategy target/edge. We use TP_PCT as the "gross edge" assumption.
+TP_PCT = float(os.getenv("TP_PCT", "1.3"))
+
+# Minimum required net profit AFTER fees+slippage.
+MIN_NET_PROFIT_PCT = float(os.getenv("MIN_NET_PROFIT_PCT", "0.60"))
+
 BLOCK_SIGNALS_WHEN_ACTIVE_OCO = os.getenv("BLOCK_SIGNALS_WHEN_ACTIVE_OCO", "true").strip().lower() == "true"
 
 GEN_DEBUG = os.getenv("GEN_DEBUG", "true").strip().lower() == "true"
@@ -167,6 +190,38 @@ def _vol_regime(atr_pct: float) -> str:
     if atr_pct <= 0.30:
         return "LOW"
     return "NORMAL"
+
+
+def _edge_ok(atr_pct: float) -> Tuple[bool, str]:
+    """Fee-aware edge gate.
+
+    We only take trades if the assumed gross edge (TP_PCT) can pay:
+      - estimated round-trip trading fees
+      - estimated slippage/spread
+      - and still leave MIN_NET_PROFIT_PCT net.
+
+    Also requires ATR% to be high enough to realistically reach TP on this TF.
+    """
+    # Feasibility: if ATR is below TP, hitting TP is less likely.
+    if atr_pct < MIN_MOVE_PCT:
+        return False, f"ATR_TOO_LOW atr%={atr_pct:.2f} < MIN_MOVE_PCT={MIN_MOVE_PCT:.2f}"
+
+    assumed_gross_edge = TP_PCT
+    assumed_cost = ESTIMATED_ROUNDTRIP_FEE_PCT + ESTIMATED_SLIPPAGE_PCT
+    assumed_net = assumed_gross_edge - assumed_cost
+
+    if assumed_net < MIN_NET_PROFIT_PCT:
+        return False, (
+            "EDGE_TOO_SMALL "
+            f"TP_PCT={assumed_gross_edge:.2f} cost={assumed_cost:.2f} net={assumed_net:.2f} "
+            f"< MIN_NET_PROFIT_PCT={MIN_NET_PROFIT_PCT:.2f}"
+        )
+
+    # Additional sanity: ATR should at least be in the ballpark of TP.
+    if atr_pct < (assumed_gross_edge * 0.75):
+        return False, f"ATR_BELOW_TP atr%={atr_pct:.2f} < 0.75*TP_PCT={assumed_gross_edge*0.75:.2f}"
+
+    return True, "OK"
 
 
 def _trend_strength(last: float, ma20: float) -> float:
@@ -347,6 +402,34 @@ def generate_signal() -> Optional[Dict[str, Any]]:
 
         # TRADE only if final decision says EXECUTE
         if decision["final_trade_decision"] != "EXECUTE":
+            continue
+
+        # -----------------------------
+        # EXTRA LIVE GUARDS (fee-aware)
+        # -----------------------------
+
+        # 1) Avoid chop: require distance from MA
+        ma_gap_abs = abs(_pct(last, ma20))
+        if ma_gap_abs < MA_GAP_PCT:
+            if GEN_DEBUG:
+                logger.info(
+                    f"[GEN] BLOCKED_BY_MA_GAP | symbol={symbol} gap%={ma_gap_abs:.3f} < MA_GAP_PCT={MA_GAP_PCT:.3f}"
+                )
+            continue
+
+        # 2) Confidence floor (extra check)
+        if conf < BUY_CONFIDENCE_MIN:
+            if GEN_DEBUG:
+                logger.info(
+                    f"[GEN] BLOCKED_BY_CONF | symbol={symbol} conf={conf:.3f} < BUY_CONFIDENCE_MIN={BUY_CONFIDENCE_MIN:.3f}"
+                )
+            continue
+
+        # 3) Fee-aware edge gate
+        ok_edge, edge_reason = _edge_ok(atrp)
+        if not ok_edge:
+            if GEN_DEBUG:
+                logger.info(f"[GEN] BLOCKED_BY_EDGE | symbol={symbol} reason={edge_reason}")
             continue
 
         # Safety: don't emit live trades if not allowed
