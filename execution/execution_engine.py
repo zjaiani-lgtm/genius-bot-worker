@@ -1,6 +1,7 @@
 import os
+import time
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, Optional, Tuple
 
 import ccxt
 
@@ -13,6 +14,7 @@ from execution.db.repository import (
     update_system_state,
     signal_id_already_executed,
     mark_signal_id_executed,
+    has_active_oco_for_symbol,
 )
 
 from execution.kill_switch import is_kill_switch_active
@@ -34,12 +36,17 @@ def _to_bool01(v: Any) -> bool:
     return False
 
 
+def _norm(s: Any) -> str:
+    return str(s or "").strip().lower()
+
+
 class ExecutionEngine:
     def __init__(self):
         self.mode = os.getenv("MODE", "DEMO").upper()
         self.env_kill_switch = os.getenv("KILL_SWITCH", "false").lower() == "true"
         self.live_confirmation = os.getenv("LIVE_CONFIRMATION", "false").lower() == "true"
 
+        # public price feed (no keys)
         self.price_feed = ccxt.binance({"enableRateLimit": True})
 
         self.exchange = None
@@ -49,13 +56,31 @@ class ExecutionEngine:
 
         self.state_debug = os.getenv("STATE_DEBUG", "false").lower() == "true"
 
-        self.tp_pct = float(os.getenv("TP_PCT", "0.30"))
-        self.sl_pct = float(os.getenv("SL_PCT", "1.00"))
-        self.sl_limit_gap_pct = float(os.getenv("SL_LIMIT_GAP_PCT", "0.10"))
+        # OCO params
+        self.tp_pct = float(os.getenv("TP_PCT", "1.30"))
+        self.sl_pct = float(os.getenv("SL_PCT", "0.70"))
+        self.sl_limit_gap_pct = float(os.getenv("SL_LIMIT_GAP_PCT", "0.15"))
 
         self.sell_buffer = float(os.getenv("SELL_BUFFER", "0.999"))
-        self.sell_retry_buffer = float(os.getenv("SELL_RETRY_BUFFER", "0.995"))
+        self.sell_retry_buffer = float(os.getenv("SELL_RETRY_BUFFER", "0.998"))
 
+        # ---- New protective gates (Execution side) ----
+        # Spread gate: if too wide, MARKET entry gets eaten.
+        self.max_spread_pct = float(os.getenv("MAX_SPREAD_PCT", "0.12"))  # 0.12% default
+
+        # Fee-aware net gate (Execution side)
+        self.estimated_roundtrip_fee_pct = float(os.getenv("ESTIMATED_ROUNDTRIP_FEE_PCT", "0.20"))
+        self.estimated_slippage_pct = float(os.getenv("ESTIMATED_SLIPPAGE_PCT", "0.15"))
+        self.min_net_profit_pct = float(os.getenv("MIN_NET_PROFIT_PCT", "0.60"))
+
+        # Entry mode: MARKET (default) or MAKER_LIMIT (optional if supported)
+        self.entry_mode = os.getenv("ENTRY_MODE", "MARKET").strip().upper()  # MARKET | MAKER_LIMIT
+        self.limit_entry_offset_pct = float(os.getenv("LIMIT_ENTRY_OFFSET_PCT", "0.02"))  # 0.02% below best bid
+        self.limit_entry_timeout_sec = int(os.getenv("LIMIT_ENTRY_TIMEOUT_SEC", "6"))  # cancel if not filled fast
+
+    # ----------------------------
+    # System state
+    # ----------------------------
     def _load_system_state(self) -> Dict[str, Any]:
         raw = get_system_state()
         if self.state_debug:
@@ -81,6 +106,40 @@ class ExecutionEngine:
         return {"status": "", "startup_sync_ok": False, "kill_switch": False}
 
     # ----------------------------
+    # Market micro-helpers
+    # ----------------------------
+    def _get_spread_pct(self, symbol: str) -> Optional[float]:
+        """
+        Spread% = (ask - bid) / mid * 100
+        Uses public orderbook.
+        """
+        try:
+            ob = self.price_feed.fetch_order_book(symbol, limit=5)
+            bids = ob.get("bids") or []
+            asks = ob.get("asks") or []
+            if not bids or not asks:
+                return None
+            bid = float(bids[0][0])
+            ask = float(asks[0][0])
+            mid = (bid + ask) / 2.0 if (bid + ask) else 0.0
+            if mid <= 0:
+                return None
+            return ((ask - bid) / mid) * 100.0
+        except Exception as e:
+            logger.warning(f"SPREAD_FETCH_FAIL | symbol={symbol} err={e}")
+            return None
+
+    def _net_edge_ok(self) -> Tuple[bool, str]:
+        """
+        Execution-side edge gate: TP must cover costs and leave MIN_NET_PROFIT_PCT.
+        """
+        cost = self.estimated_roundtrip_fee_pct + self.estimated_slippage_pct
+        net = self.tp_pct - cost
+        if net < self.min_net_profit_pct:
+            return False, f"EDGE_TOO_SMALL tp={self.tp_pct:.2f} cost={cost:.2f} net={net:.2f} < min_net={self.min_net_profit_pct:.2f}"
+        return True, "OK"
+
+    # ----------------------------
     # OCO reconcile
     # ----------------------------
     def reconcile_oco(self) -> None:
@@ -92,9 +151,6 @@ class ExecutionEngine:
         rows = list_active_oco_links(limit=50)
         if not rows:
             return
-
-        def _norm(s: Any) -> str:
-            return str(s or "").strip().lower()
 
         CLOSED = {"closed", "filled"}
         CANCELED = {"canceled", "cancelled", "expired", "rejected"}
@@ -148,16 +204,8 @@ class ExecutionEngine:
     # SELL (early exit) execution
     # ----------------------------
     def _execute_sell(self, signal_id: str, symbol: str, signal_hash: str = None) -> None:
-        """Close an existing position early.
-
-        Strategy:
-        1) Cancel any ACTIVE OCO orders for this symbol.
-        2) Market sell the available free base balance.
-        3) Mark signal executed to avoid retry loops.
-        """
         logger.info(f"SELL_ENTER | id={signal_id} symbol={symbol} MODE={self.mode}")
 
-        # DEMO: just log (no wallet state tracking yet)
         if self.mode == "DEMO":
             log_event("SELL_DEMO", f"{signal_id} DEMO SELL {symbol}")
             mark_signal_id_executed(signal_id, signal_hash=signal_hash, action="SELL_DEMO", symbol=str(symbol))
@@ -168,25 +216,18 @@ class ExecutionEngine:
             logger.warning(f"SELL_BLOCKED | exchange client not wired | id={signal_id} symbol={symbol}")
             return
 
-        # last-millisecond kill switch
         if is_kill_switch_active():
             logger.error(f"KILL_SWITCH_ACTIVE_LAST_GATE | SELL_BLOCKED | id={signal_id} symbol={symbol}")
             log_event("SELL_BLOCKED_KILL_SWITCH_LAST_GATE", f"{signal_id} {symbol}")
             return
 
-        # 1) Cancel active OCO (if any)
+        # cancel OCO legs best-effort
         rows = list_active_oco_links(limit=50)
         rows = [r for r in rows if str(r[2] or "").upper() == str(symbol).upper()]
-
-        def _norm(s: Any) -> str:
-            return str(s or "").strip().lower()
-
         CLOSED = {"closed", "filled"}
 
         for r in rows:
             link_id, oco_signal_id, sym, base_asset, tp_order_id, sl_order_id, *_rest = r
-
-            # Try to detect if one leg already filled
             try:
                 tp = self.exchange.fetch_order(tp_order_id, symbol)
                 sl = self.exchange.fetch_order(sl_order_id, symbol)
@@ -202,7 +243,6 @@ class ExecutionEngine:
                     log_event("SELL_SKIP", f"{signal_id} {symbol} already closed by SL (link={link_id})")
                     continue
 
-                # Cancel both legs best-effort
                 for oid in (tp_order_id, sl_order_id):
                     if not oid:
                         continue
@@ -217,7 +257,6 @@ class ExecutionEngine:
             except Exception as e:
                 logger.warning(f"SELL_OCO_LOOKUP_FAIL | id={signal_id} symbol={symbol} link={link_id} err={e}")
 
-        # 2) Market sell available base
         base_asset = symbol.split("/")[0].upper()
         free_base = float(self.exchange.fetch_balance_free(base_asset))
         sell_amount = self.exchange.floor_amount(symbol, free_base * self.sell_buffer)
@@ -240,8 +279,78 @@ class ExecutionEngine:
         except Exception as e:
             logger.exception(f"SELL_LIVE_ERROR | id={signal_id} symbol={symbol} err={e}")
             log_event("SELL_LIVE_ERROR", f"{signal_id} {symbol} err={e}")
-            # Do not mark executed on hard error: allow retry if signal repeats
             return
+
+    # ----------------------------
+    # Entry execution helpers
+    # ----------------------------
+    def _place_entry_buy(self, symbol: str, quote_amount: float) -> Tuple[Dict[str, Any], float]:
+        """
+        Returns (buy_order, buy_avg_price)
+
+        Supports:
+        - MAKER_LIMIT if exchange client supports it (optional)
+        - otherwise MARKET by quote
+        """
+        if self.exchange is None:
+            raise RuntimeError("exchange client not wired")
+
+        # spread gate (especially important if we are about to MARKET buy)
+        sp = self._get_spread_pct(symbol)
+        if sp is not None and sp > self.max_spread_pct:
+            raise RuntimeError(f"SPREAD_TOO_WIDE spread%={sp:.4f} > MAX_SPREAD_PCT={self.max_spread_pct:.4f}")
+
+        if self.entry_mode == "MAKER_LIMIT":
+            # Optional: only if your BinanceSpotClient has these methods
+            if hasattr(self.exchange, "place_limit_buy_postonly") and hasattr(self.exchange, "fetch_order") and hasattr(self.exchange, "cancel_order"):
+                ob = self.price_feed.fetch_order_book(symbol, limit=5)
+                bid = float((ob.get("bids") or [[0, 0]])[0][0])
+                if bid <= 0:
+                    raise RuntimeError("NO_BID_FOR_LIMIT_ENTRY")
+
+                # price a bit below bid to avoid taker
+                limit_price = bid * (1.0 - (self.limit_entry_offset_pct / 100.0))
+                limit_price = self.exchange.floor_price(symbol, limit_price)
+
+                base_amount = quote_amount / limit_price
+                base_amount = self.exchange.floor_amount(symbol, base_amount)
+                if base_amount <= 0:
+                    raise RuntimeError("LIMIT_ENTRY_SIZE_ZERO")
+
+                buy = self.exchange.place_limit_buy_postonly(symbol=symbol, base_amount=base_amount, price=limit_price)
+                oid = str(buy.get("id") or "")
+
+                t0 = time.time()
+                filled = False
+                last_avg = 0.0
+
+                while time.time() - t0 < float(self.limit_entry_timeout_sec):
+                    o = self.exchange.fetch_order(oid, symbol)
+                    st = _norm(o.get("status"))
+                    last_avg = float(o.get("average") or o.get("price") or 0.0) or last_avg
+                    if st in ("closed", "filled"):
+                        filled = True
+                        buy = o
+                        break
+                    time.sleep(0.35)
+
+                if not filled:
+                    try:
+                        self.exchange.cancel_order(oid, symbol)
+                    except Exception:
+                        pass
+                    raise RuntimeError(f"LIMIT_ENTRY_TIMEOUT timeout={self.limit_entry_timeout_sec}s")
+
+                buy_avg = float(buy.get("average") or buy.get("price") or 0.0) or last_avg or self.exchange.fetch_last_price(symbol)
+                return buy, buy_avg
+
+            # fallback
+            logger.warning("MAKER_LIMIT requested but exchange client lacks place_limit_buy_postonly; fallback to MARKET")
+
+        # MARKET
+        buy = self.exchange.place_market_buy_by_quote(symbol=symbol, quote_amount=quote_amount)
+        buy_avg = float(buy.get("average") or buy.get("price") or 0.0) or self.exchange.fetch_last_price(symbol)
+        return buy, buy_avg
 
     # ----------------------------
     # Main execution
@@ -252,7 +361,7 @@ class ExecutionEngine:
 
         logger.info(f"EXEC_ENTER | id={signal_id} verdict={verdict} MODE={self.mode} ENV_KILL_SWITCH={self.env_kill_switch}")
 
-        # ✅ IDEMPOTENCY
+        # idempotency
         try:
             if signal_id_already_executed(signal_id):
                 logger.warning(f"EXEC_DEDUPED | duplicate ignored | id={signal_id}")
@@ -296,9 +405,7 @@ class ExecutionEngine:
         position_size = execution.get("position_size")
         quote_amount = execution.get("quote_amount")
 
-        # ----------------------------
-        # SELL (early exit) handling
-        # ----------------------------
+        # SELL
         if verdict == "SELL":
             if not symbol or direction != "LONG":
                 logger.warning(f"EXEC_REJECT | bad SELL payload | id={signal_id} symbol={symbol} dir={direction}")
@@ -309,6 +416,7 @@ class ExecutionEngine:
             self._execute_sell(signal_id=signal_id, symbol=str(symbol), signal_hash=signal_hash)
             return
 
+        # only LONG market entry signals are accepted (compat)
         if not symbol or direction != "LONG" or entry_type != "MARKET":
             logger.warning(f"EXEC_REJECT | bad payload | id={signal_id} symbol={symbol} dir={direction} entry={entry_type}")
             log_event("REJECT_BAD_PAYLOAD", f"{signal_id}")
@@ -334,16 +442,40 @@ class ExecutionEngine:
             logger.warning(f"EXEC_BLOCKED | exchange client not wired | id={signal_id}")
             return
 
-        # import these here (avoid circular)
+        # import here
         from execution.exchange_client import LiveTradingBlocked
 
         try:
+            # ---- execution-side edge gate ----
+            ok_edge, edge_reason = self._net_edge_ok()
+            if not ok_edge:
+                msg = f"EXEC_REJECT | EDGE_GATE | id={signal_id} symbol={symbol} {edge_reason}"
+                logger.warning(msg)
+                log_event("EXEC_REJECT_EDGE_GATE", msg)
+                mark_signal_id_executed(signal_id, signal_hash=signal_hash, action="REJECT_EDGE_GATE", symbol=str(symbol))
+                return
+
+            # size
             if quote_amount is None:
                 last = self.exchange.fetch_last_price(symbol)
                 quote_amount = float(position_size) * float(last)
             quote_amount = float(quote_amount)
 
-            # ✅ Binance NOTIONAL gate
+            # ---- race-condition guard: never buy if active OCO already exists ----
+            try:
+                if has_active_oco_for_symbol(str(symbol)):
+                    msg = f"EXEC_REJECT | ACTIVE_OCO_RACE | id={signal_id} symbol={symbol}"
+                    logger.warning(msg)
+                    log_event("EXEC_REJECT_ACTIVE_OCO_RACE", msg)
+                    mark_signal_id_executed(signal_id, signal_hash=signal_hash, action="REJECT_ACTIVE_OCO_RACE", symbol=str(symbol))
+                    return
+            except Exception as e:
+                msg = f"EXEC_BLOCKED | ACTIVE_OCO_CHECK_FAIL | id={signal_id} symbol={symbol} err={e}"
+                logger.warning(msg)
+                log_event("EXEC_BLOCKED_ACTIVE_OCO_CHECK_FAIL", msg)
+                return
+
+            # MIN_NOTIONAL
             min_notional = 0.0
             try:
                 min_notional = float(self.exchange.get_min_notional(symbol))
@@ -360,21 +492,20 @@ class ExecutionEngine:
                 mark_signal_id_executed(signal_id, signal_hash=signal_hash, action="REJECT_MIN_NOTIONAL", symbol=str(symbol))
                 return
 
-            # ✅ last-millisecond kill switch
             if is_kill_switch_active():
                 logger.error(f"KILL_SWITCH_ACTIVE_LAST_GATE | BUY_BLOCKED | id={signal_id}")
                 log_event("EXEC_BLOCKED_KILL_SWITCH_LAST_GATE", f"{signal_id} BUY_BLOCKED")
                 return
 
-            # BUY
-            buy = self.exchange.place_market_buy_by_quote(symbol=symbol, quote_amount=quote_amount)
-            buy_avg = float(buy.get("average") or buy.get("price") or 0.0) or self.exchange.fetch_last_price(symbol)
+            # BUY (MARKET or optional MAKER_LIMIT)
+            buy, buy_avg = self._place_entry_buy(symbol=str(symbol), quote_amount=quote_amount)
 
             logger.info(f"EXEC_LIVE_BUY_OK | id={signal_id} symbol={symbol} quote={quote_amount} avg={buy_avg} order_id={buy.get('id')}")
             log_event("TRADE_EXECUTED", f"{signal_id} LIVE BUY {symbol} quote={quote_amount} avg={buy_avg} order_id={buy.get('id')}")
 
             mark_signal_id_executed(signal_id, signal_hash=signal_hash, action="TRADE_LIVE_BUY", symbol=str(symbol))
 
+            # base amount for OCO
             base_asset = symbol.split("/")[0].upper()
             free_base = float(self.exchange.fetch_balance_free(base_asset))
 
@@ -479,11 +610,9 @@ class ExecutionEngine:
             log_event("TRADE_LIVE_ARMED", f"{signal_id} {symbol} OCO_ARMED listOrderId={list_order_id}")
 
         except LiveTradingBlocked as e:
-            # ✅ This is a controlled safety block, not a crash.
             msg = f"EXEC_REJECT | LIVE_BLOCKED | id={signal_id} reason={e}"
             logger.warning(msg)
             log_event("EXEC_REJECT_LIVE_BLOCKED", msg)
-            # ✅ Mark to prevent endless retry spam
             mark_signal_id_executed(signal_id, signal_hash=signal_hash, action="REJECT_LIVE_BLOCKED", symbol=str(symbol))
             return
 
