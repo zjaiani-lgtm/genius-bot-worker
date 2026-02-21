@@ -320,3 +320,142 @@ def get_trade_stats() -> Dict[str, Any]:
         "gross_loss": float(gross_loss),
         "profit_factor": float(profit_factor),
     }
+
+# ==============================
+# TRADE PERFORMANCE (NEW)
+# Append this block at the end of execution/db/repository.py
+# ==============================
+
+import time
+
+def _ensure_trades_table(conn) -> None:
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS trades (
+            signal_id   TEXT PRIMARY KEY,
+            symbol      TEXT NOT NULL,
+            qty         REAL NOT NULL,
+            quote_in    REAL NOT NULL,
+            entry_price REAL NOT NULL,
+            opened_at   INTEGER NOT NULL,
+            exit_price  REAL,
+            closed_at   INTEGER,
+            outcome     TEXT,
+            pnl_quote   REAL,
+            pnl_pct     REAL
+        )
+    """)
+    conn.commit()
+
+
+def open_trade(signal_id: str, symbol: str, qty: float, quote_in: float, entry_price: float) -> None:
+    from execution.db.db import get_conn
+    conn = get_conn()
+    _ensure_trades_table(conn)
+
+    now = int(time.time())
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT OR REPLACE INTO trades (
+            signal_id, symbol, qty, quote_in, entry_price, opened_at,
+            exit_price, closed_at, outcome, pnl_quote, pnl_pct
+        ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL)
+    """, (str(signal_id), str(symbol), float(qty), float(quote_in), float(entry_price), now))
+    conn.commit()
+
+
+def get_trade(signal_id: str):
+    from execution.db.db import get_conn
+    conn = get_conn()
+    _ensure_trades_table(conn)
+
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT signal_id, symbol, qty, quote_in, entry_price, opened_at,
+               exit_price, closed_at, outcome, pnl_quote, pnl_pct
+        FROM trades
+        WHERE signal_id = ?
+    """, (str(signal_id),))
+    return cur.fetchone()
+
+
+def close_trade(signal_id: str, exit_price: float, outcome: str, pnl_quote: float, pnl_pct: float) -> None:
+    from execution.db.db import get_conn
+    conn = get_conn()
+    _ensure_trades_table(conn)
+
+    now = int(time.time())
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE trades
+        SET exit_price = ?,
+            closed_at  = ?,
+            outcome    = ?,
+            pnl_quote  = ?,
+            pnl_pct    = ?
+        WHERE signal_id = ?
+    """, (float(exit_price), now, str(outcome), float(pnl_quote), float(pnl_pct), str(signal_id)))
+    conn.commit()
+
+
+def get_trade_stats() -> dict:
+    """
+    CLOSED stats + OPEN stats (count + quote_in sum)
+    """
+    from execution.db.db import get_conn
+    conn = get_conn()
+    _ensure_trades_table(conn)
+
+    cur = conn.cursor()
+
+    # ---- CLOSED trades ----
+    cur.execute("""
+        SELECT
+            COUNT(*)                                       AS closed_trades,
+            SUM(CASE WHEN pnl_quote > 0 THEN 1 ELSE 0 END) AS wins,
+            SUM(CASE WHEN pnl_quote <= 0 THEN 1 ELSE 0 END) AS losses,
+            COALESCE(SUM(pnl_quote), 0)                    AS pnl_quote_sum,
+            COALESCE(SUM(quote_in), 0)                     AS quote_in_sum,
+            COALESCE(SUM(CASE WHEN pnl_quote > 0 THEN pnl_quote ELSE 0 END), 0) AS gross_profit,
+            COALESCE(ABS(SUM(CASE WHEN pnl_quote < 0 THEN pnl_quote ELSE 0 END)), 0) AS gross_loss
+        FROM trades
+        WHERE closed_at IS NOT NULL
+    """)
+    row = cur.fetchone() or (0, 0, 0, 0.0, 0.0, 0.0, 0.0)
+
+    closed_trades = int(row[0] or 0)
+    wins = int(row[1] or 0)
+    losses = int(row[2] or 0)
+    pnl_quote_sum = float(row[3] or 0.0)
+    quote_in_sum = float(row[4] or 0.0)
+    gross_profit = float(row[5] or 0.0)
+    gross_loss = float(row[6] or 0.0)
+
+    winrate_pct = (wins / closed_trades * 100.0) if closed_trades else 0.0
+    roi_pct = (pnl_quote_sum / quote_in_sum * 100.0) if quote_in_sum else 0.0
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (gross_profit if gross_profit > 0 else 0.0)
+
+    # ---- OPEN trades ----
+    cur.execute("""
+        SELECT
+            COUNT(*) AS open_trades,
+            COALESCE(SUM(quote_in), 0) AS open_quote_in_sum
+        FROM trades
+        WHERE closed_at IS NULL
+    """)
+    row2 = cur.fetchone() or (0, 0.0)
+    open_trades = int(row2[0] or 0)
+    open_quote_in_sum = float(row2[1] or 0.0)
+
+    return {
+        "closed_trades": closed_trades,
+        "wins": wins,
+        "losses": losses,
+        "winrate_pct": winrate_pct,
+        "roi_pct": roi_pct,
+        "pnl_quote_sum": pnl_quote_sum,
+        "quote_in_sum": quote_in_sum,
+        "profit_factor": profit_factor,
+        "open_trades": open_trades,
+        "open_quote_in_sum": open_quote_in_sum,
+    }
