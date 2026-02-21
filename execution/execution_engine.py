@@ -1,3 +1,4 @@
+# execution/execution_engine.py
 import os
 import time
 import logging
@@ -16,7 +17,7 @@ from execution.db.repository import (
     mark_signal_id_executed,
     has_active_oco_for_symbol,
 
-    # ✅ NEW (performance tracking)
+    # ✅ performance tracking
     open_trade,
     get_trade,
     close_trade,
@@ -69,14 +70,13 @@ class ExecutionEngine:
         self.sell_buffer = float(os.getenv("SELL_BUFFER", "0.999"))
         self.sell_retry_buffer = float(os.getenv("SELL_RETRY_BUFFER", "0.998"))
 
-        # ---- New protective gates (Execution side) ----
+        # ---- Protective gates (Execution side) ----
         self.max_spread_pct = float(os.getenv("MAX_SPREAD_PCT", "0.12"))  # 0.12% default
-
         self.estimated_roundtrip_fee_pct = float(os.getenv("ESTIMATED_ROUNDTRIP_FEE_PCT", "0.20"))
         self.estimated_slippage_pct = float(os.getenv("ESTIMATED_SLIPPAGE_PCT", "0.15"))
         self.min_net_profit_pct = float(os.getenv("MIN_NET_PROFIT_PCT", "0.60"))
 
-        # Entry mode: MARKET (default) or MAKER_LIMIT (optional if supported)
+        # Entry mode
         self.entry_mode = os.getenv("ENTRY_MODE", "MARKET").strip().upper()  # MARKET | MAKER_LIMIT
         self.limit_entry_offset_pct = float(os.getenv("LIMIT_ENTRY_OFFSET_PCT", "0.02"))  # 0.02% below best bid
         self.limit_entry_timeout_sec = int(os.getenv("LIMIT_ENTRY_TIMEOUT_SEC", "6"))  # cancel if not filled fast
@@ -112,10 +112,7 @@ class ExecutionEngine:
     # Market micro-helpers
     # ----------------------------
     def _get_spread_pct(self, symbol: str) -> Optional[float]:
-        """
-        Spread% = (ask - bid) / mid * 100
-        Uses public orderbook.
-        """
+        """Spread% = (ask - bid) / mid * 100"""
         try:
             ob = self.price_feed.fetch_order_book(symbol, limit=5)
             bids = ob.get("bids") or []
@@ -133,17 +130,17 @@ class ExecutionEngine:
             return None
 
     def _net_edge_ok(self) -> Tuple[bool, str]:
-        """
-        Execution-side edge gate: TP must cover costs and leave MIN_NET_PROFIT_PCT.
-        """
+        """TP must cover costs and leave MIN_NET_PROFIT_PCT."""
         cost = self.estimated_roundtrip_fee_pct + self.estimated_slippage_pct
         net = self.tp_pct - cost
         if net < self.min_net_profit_pct:
-            return False, f"EDGE_TOO_SMALL tp={self.tp_pct:.2f} cost={cost:.2f} net={net:.2f} < min_net={self.min_net_profit_pct:.2f}"
+            return False, (
+                f"EDGE_TOO_SMALL tp={self.tp_pct:.2f} cost={cost:.2f} net={net:.2f} < min_net={self.min_net_profit_pct:.2f}"
+            )
         return True, "OK"
 
     # ----------------------------
-    # PnL helpers (NEW)
+    # PnL helpers
     # ----------------------------
     @staticmethod
     def _exit_price_from_order(o: Dict[str, Any], fallback: float = 0.0) -> float:
@@ -155,18 +152,12 @@ class ExecutionEngine:
 
     @staticmethod
     def _calc_pnl(quote_in: float, entry: float, exitp: float, qty: float) -> Tuple[float, float]:
-        """
-        Approx realized PnL:
-          pnl_quote = (exit - entry) * qty
-          pnl_pct   = pnl_quote / quote_in * 100
-        (fees not included here; you can enhance later using order fee fields)
-        """
         pnl_quote = (float(exitp) - float(entry)) * float(qty)
         pnl_pct = (pnl_quote / float(quote_in) * 100.0) if float(quote_in) else 0.0
         return float(pnl_quote), float(pnl_pct)
 
     # ----------------------------
-    # OCO reconcile (UPDATED: closes trades)
+    # OCO reconcile (closes trades)
     # ----------------------------
     def reconcile_oco(self) -> None:
         if self.mode not in ("LIVE", "TESTNET"):
@@ -213,13 +204,14 @@ class ExecutionEngine:
                     exitp = self._exit_price_from_order(sl, fallback=float(sl_stop_price))
 
                     if tr:
-                        # (signal_id, symbol, qty, quote_in, entry_price, opened_at, exit_price, closed_at, outcome, pnl_quote, pnl_pct)
                         _, _, qty, quote_in, entry_price, *_ = tr
                         pnl_quote, pnl_pct = self._calc_pnl(float(quote_in), float(entry_price), float(exitp), float(qty))
                         close_trade(signal_id, exit_price=float(exitp), outcome="SL", pnl_quote=float(pnl_quote), pnl_pct=float(pnl_pct))
                         log_event("TRADE_CLOSED", f"{signal_id} {symbol} SL exit={exitp} pnl_quote={pnl_quote:.4f} pnl_pct={pnl_pct:.3f}")
+                        logger.info(f"TRADE_CLOSED | id={signal_id} symbol={symbol} outcome=SL exit={exitp} pnl_quote={pnl_quote:.4f} pnl_pct={pnl_pct:.3f}")
                     else:
                         log_event("TRADE_CLOSE_WARN", f"{signal_id} {symbol} SL filled but trade row missing")
+                        logger.warning(f"TRADE_CLOSE_WARN | id={signal_id} symbol={symbol} SL filled but trade missing")
 
                     log_event("OCO_CLOSED", f"{signal_id} SL_FILLED sl={sl_order_id} tp={tp_order_id} tp_status={tp_status}")
                     continue
@@ -236,17 +228,17 @@ class ExecutionEngine:
                         pnl_quote, pnl_pct = self._calc_pnl(float(quote_in), float(entry_price), float(exitp), float(qty))
                         close_trade(signal_id, exit_price=float(exitp), outcome="TP", pnl_quote=float(pnl_quote), pnl_pct=float(pnl_pct))
                         log_event("TRADE_CLOSED", f"{signal_id} {symbol} TP exit={exitp} pnl_quote={pnl_quote:.4f} pnl_pct={pnl_pct:.3f}")
+                        logger.info(f"TRADE_CLOSED | id={signal_id} symbol={symbol} outcome=TP exit={exitp} pnl_quote={pnl_quote:.4f} pnl_pct={pnl_pct:.3f}")
                     else:
                         log_event("TRADE_CLOSE_WARN", f"{signal_id} {symbol} TP filled but trade row missing")
+                        logger.warning(f"TRADE_CLOSE_WARN | id={signal_id} symbol={symbol} TP filled but trade missing")
 
                     log_event("OCO_CLOSED", f"{signal_id} TP_FILLED tp={tp_order_id} sl={sl_order_id} sl_status={sl_status}")
                     continue
 
-                # One canceled but the other open: ignore (exchange might be processing)
                 if (tp_status in CANCELED and sl_status == "open") or (sl_status in CANCELED and tp_status == "open"):
                     continue
 
-                # Both canceled -> failed
                 if tp_status in CANCELED and sl_status in CANCELED:
                     set_oco_status(link_id, "FAILED")
                     log_event("OCO_FAILED", f"{signal_id} tp={tp_order_id}:{tp_status} sl={sl_order_id}:{sl_status}")
@@ -340,30 +332,21 @@ class ExecutionEngine:
     # Entry execution helpers
     # ----------------------------
     def _place_entry_buy(self, symbol: str, quote_amount: float) -> Tuple[Dict[str, Any], float]:
-        """
-        Returns (buy_order, buy_avg_price)
-
-        Supports:
-        - MAKER_LIMIT if exchange client supports it (optional)
-        - otherwise MARKET by quote
-        """
+        """Returns (buy_order, buy_avg_price)"""
         if self.exchange is None:
             raise RuntimeError("exchange client not wired")
 
-        # spread gate (especially important if we are about to MARKET buy)
         sp = self._get_spread_pct(symbol)
         if sp is not None and sp > self.max_spread_pct:
             raise RuntimeError(f"SPREAD_TOO_WIDE spread%={sp:.4f} > MAX_SPREAD_PCT={self.max_spread_pct:.4f}")
 
         if self.entry_mode == "MAKER_LIMIT":
-            # Optional: only if your BinanceSpotClient has these methods
             if hasattr(self.exchange, "place_limit_buy_postonly") and hasattr(self.exchange, "fetch_order") and hasattr(self.exchange, "cancel_order"):
                 ob = self.price_feed.fetch_order_book(symbol, limit=5)
                 bid = float((ob.get("bids") or [[0, 0]])[0][0])
                 if bid <= 0:
                     raise RuntimeError("NO_BID_FOR_LIMIT_ENTRY")
 
-                # price a bit below bid to avoid taker
                 limit_price = bid * (1.0 - (self.limit_entry_offset_pct / 100.0))
                 limit_price = self.exchange.floor_price(symbol, limit_price)
 
@@ -399,10 +382,8 @@ class ExecutionEngine:
                 buy_avg = float(buy.get("average") or buy.get("price") or 0.0) or last_avg or self.exchange.fetch_last_price(symbol)
                 return buy, buy_avg
 
-            # fallback
             logger.warning("MAKER_LIMIT requested but exchange client lacks place_limit_buy_postonly; fallback to MARKET")
 
-        # MARKET
         buy = self.exchange.place_market_buy_by_quote(symbol=symbol, quote_amount=quote_amount)
         buy_avg = float(buy.get("average") or buy.get("price") or 0.0) or self.exchange.fetch_last_price(symbol)
         return buy, buy_avg
@@ -471,7 +452,7 @@ class ExecutionEngine:
             self._execute_sell(signal_id=signal_id, symbol=str(symbol), signal_hash=signal_hash)
             return
 
-        # only LONG market entry signals are accepted (compat)
+        # only LONG market entry signals
         if not symbol or direction != "LONG" or entry_type != "MARKET":
             logger.warning(f"EXEC_REJECT | bad payload | id={signal_id} symbol={symbol} dir={direction} entry={entry_type}")
             log_event("REJECT_BAD_PAYLOAD", f"{signal_id}")
@@ -491,17 +472,14 @@ class ExecutionEngine:
             mark_signal_id_executed(signal_id, signal_hash=signal_hash, action="TRADE_DEMO", symbol=str(symbol))
             return
 
-        # LIVE/TESTNET
         if self.exchange is None:
             log_event("EXEC_BLOCKED_NO_EXCHANGE", f"{signal_id}")
             logger.warning(f"EXEC_BLOCKED | exchange client not wired | id={signal_id}")
             return
 
-        # import here
         from execution.exchange_client import LiveTradingBlocked
 
         try:
-            # ---- execution-side edge gate ----
             ok_edge, edge_reason = self._net_edge_ok()
             if not ok_edge:
                 msg = f"EXEC_REJECT | EDGE_GATE | id={signal_id} symbol={symbol} {edge_reason}"
@@ -516,7 +494,7 @@ class ExecutionEngine:
                 quote_amount = float(position_size) * float(last)
             quote_amount = float(quote_amount)
 
-            # ---- race-condition guard: never buy if active OCO already exists ----
+            # race-condition guard
             try:
                 if has_active_oco_for_symbol(str(symbol)):
                     msg = f"EXEC_REJECT | ACTIVE_OCO_RACE | id={signal_id} symbol={symbol}"
@@ -538,10 +516,7 @@ class ExecutionEngine:
                 min_notional = 0.0
 
             if min_notional > 0 and quote_amount < min_notional:
-                msg = (
-                    f"EXEC_REJECT | MIN_NOTIONAL | id={signal_id} symbol={symbol} "
-                    f"quote={quote_amount:.8f} < min_notional={min_notional}"
-                )
+                msg = f"EXEC_REJECT | MIN_NOTIONAL | id={signal_id} symbol={symbol} quote={quote_amount:.8f} < min_notional={min_notional}"
                 logger.warning(msg)
                 log_event("EXEC_REJECT_MIN_NOTIONAL", msg)
                 mark_signal_id_executed(signal_id, signal_hash=signal_hash, action="REJECT_MIN_NOTIONAL", symbol=str(symbol))
@@ -552,7 +527,7 @@ class ExecutionEngine:
                 log_event("EXEC_BLOCKED_KILL_SWITCH_LAST_GATE", f"{signal_id} BUY_BLOCKED")
                 return
 
-            # BUY (MARKET or optional MAKER_LIMIT)
+            # BUY
             buy, buy_avg = self._place_entry_buy(symbol=str(symbol), quote_amount=quote_amount)
 
             logger.info(f"EXEC_LIVE_BUY_OK | id={signal_id} symbol={symbol} quote={quote_amount} avg={buy_avg} order_id={buy.get('id')}")
@@ -573,6 +548,24 @@ class ExecutionEngine:
                 logger.warning(msg)
                 log_event("OCO_SKIP_NO_FREE_BASE", msg)
                 return
+
+            # ✅ TRADE ENTRY SAVE (NOW YOU WILL SEE IT IN CONSOLE)
+            try:
+                open_trade(
+                    signal_id=signal_id,
+                    symbol=str(symbol),
+                    qty=float(sell_amount),
+                    quote_in=float(quote_amount),
+                    entry_price=float(buy_avg),
+                )
+                logger.info(f"TRADE_RECORDED | id={signal_id} symbol={symbol} entry={buy_avg:.6f} qty={sell_amount} quote_in={quote_amount}")
+                log_event("TRADE_RECORDED", f"{signal_id} {symbol} entry={buy_avg} qty={sell_amount} quote_in={quote_amount}")
+            except Exception as e:
+                logger.warning(f"TRADE_RECORD_FAIL | id={signal_id} symbol={symbol} err={e}")
+                try:
+                    log_event("TRADE_RECORD_FAIL", f"{signal_id} {symbol} err={e}")
+                except Exception:
+                    pass
 
             tp_price = self.exchange.floor_price(symbol, buy_avg * (1.0 + (self.tp_pct / 100.0)))
             sl_stop_price = self.exchange.floor_price(symbol, buy_avg * (1.0 - (self.sl_pct / 100.0)))
@@ -661,19 +654,6 @@ class ExecutionEngine:
                 sl_limit_price=float(sl_limit_price),
                 amount=float(sell_amount),
             )
-
-            # ✅ NEW: record trade entry (for ROI/Winrate later)
-            try:
-                open_trade(
-                    signal_id=signal_id,
-                    symbol=str(symbol),
-                    qty=float(sell_amount),
-                    quote_in=float(quote_amount),
-                    entry_price=float(buy_avg),
-                )
-                log_event("TRADE_RECORDED", f"{signal_id} {symbol} entry={buy_avg} qty={sell_amount} quote_in={quote_amount}")
-            except Exception as e:
-                logger.warning(f"TRADE_RECORD_FAIL | id={signal_id} symbol={symbol} err={e}")
 
             log_event("TRADE_LIVE_ARMED", f"{signal_id} {symbol} OCO_ARMED listOrderId={list_order_id}")
 
