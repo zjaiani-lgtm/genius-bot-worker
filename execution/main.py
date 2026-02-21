@@ -73,7 +73,7 @@ def _run_performance_report_safe() -> None:
     try:
         s = get_trade_stats()
         logger.info(
-            "PERF_REPORT | closed=%s wins=%s losses=%s winrate=%.2f%% roi=%.2f%% pnl=%.4f quote_in=%.4f pf=%.3f",
+            "PERF_REPORT | closed=%s wins=%s losses=%s winrate=%.2f%% roi=%.2f%% pnl=%.4f quote_in=%.4f pf=%.3f | open=%s open_quote_in=%.4f",
             s.get("closed_trades", 0),
             s.get("wins", 0),
             s.get("losses", 0),
@@ -82,6 +82,8 @@ def _run_performance_report_safe() -> None:
             float(s.get("pnl_quote_sum", 0.0)),
             float(s.get("quote_in_sum", 0.0)),
             float(s.get("profit_factor", 0.0)),
+            s.get("open_trades", 0),
+            float(s.get("open_quote_in_sum", 0.0)),
         )
 
         # optional: store compact snapshot in audit_log
@@ -91,7 +93,9 @@ def _run_performance_report_safe() -> None:
                 f"closed={s.get('closed_trades',0)} "
                 f"winrate={float(s.get('winrate_pct',0.0)):.2f}% "
                 f"roi={float(s.get('roi_pct',0.0)):.2f}% "
-                f"pnl={float(s.get('pnl_quote_sum',0.0)):.4f}"
+                f"pnl={float(s.get('pnl_quote_sum',0.0)):.4f} "
+                f"open={s.get('open_trades',0)} "
+                f"open_quote_in={float(s.get('open_quote_in_sum',0.0)):.4f}"
             )
         except Exception:
             pass
