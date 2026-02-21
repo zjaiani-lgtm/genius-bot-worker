@@ -1,3 +1,4 @@
+# execution/db/db.py
 import sqlite3
 from execution.config import DB_PATH
 
@@ -82,7 +83,7 @@ def init_db():
     )
     """)
 
-    # ✅ NEW: trades table (realized performance)
+    # trades (realized performance)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS trades (
         signal_id TEXT PRIMARY KEY,
@@ -94,9 +95,9 @@ def init_db():
 
         exit_price REAL,
         closed_at TEXT,
-        outcome TEXT,            -- TP / SL / MANUAL / UNKNOWN
-        pnl_quote REAL,          -- realized in quote currency approx
-        pnl_pct REAL             -- pnl_quote / quote_in * 100
+        outcome TEXT,
+        pnl_quote REAL,
+        pnl_pct REAL
     )
     """)
 
