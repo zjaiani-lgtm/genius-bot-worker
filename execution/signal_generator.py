@@ -32,6 +32,10 @@ ESTIMATED_SLIPPAGE_PCT = float(os.getenv("ESTIMATED_SLIPPAGE_PCT", "0.15"))
 TP_PCT = float(os.getenv("TP_PCT", "1.3"))
 MIN_NET_PROFIT_PCT = float(os.getenv("MIN_NET_PROFIT_PCT", "0.60"))
 
+# ✅ NEW: ATR sanity factor (replaces hardcoded 0.75)
+# Example: TP_PCT=1.0 and factor=0.20 means require atr% >= 0.20 (plus MIN_MOVE_PCT check)
+ATR_TO_TP_SANITY_FACTOR = float(os.getenv("ATR_TO_TP_SANITY_FACTOR", "0.20"))
+
 # Optional MA filters (FULL OFF switch)
 USE_MA_FILTERS = os.getenv("USE_MA_FILTERS", "true").strip().lower() == "true"
 MA_GAP_PCT = float(os.getenv("MA_GAP_PCT", "0.15"))  # used only if USE_MA_FILTERS=true
@@ -65,7 +69,7 @@ def _parse_symbols() -> List[str]:
     if not raw:
         raw = os.getenv("BOT_SYMBOL", "BTC/USDT").strip()
 
-    syms = []
+    syms: List[str] = []
     for s in raw.split(","):
         s = s.strip()
         if not s:
@@ -81,6 +85,7 @@ def _has_active_oco(symbol: str) -> bool:
     try:
         return has_active_oco_for_symbol(symbol)
     except Exception as e:
+        # safe default: assume active OCO to prevent uncontrolled trading
         logger.warning(f"[GEN] ACTIVE_OCO_CHECK_FAIL | symbol={symbol} err={e} -> assume active_oco=True")
         return True
 
@@ -142,7 +147,7 @@ def _sma(vals: List[float], n: int) -> float:
 def _atr_pct(ohlcv: List[List[float]], n: int = 14) -> float:
     if len(ohlcv) < n + 1:
         return 0.0
-    trs = []
+    trs: List[float] = []
     for i in range(-n, 0):
         high = float(ohlcv[i][2])
         low = float(ohlcv[i][3])
@@ -163,6 +168,15 @@ def _vol_regime(atr_pct: float) -> str:
 
 
 def _edge_ok(atr_pct: float) -> Tuple[bool, str]:
+    """
+    Fee-aware edge gate.
+
+    Requirements:
+      1) atr% >= MIN_MOVE_PCT
+      2) TP_PCT must cover (fees + slippage) + MIN_NET_PROFIT_PCT
+      3) atr% should be at least TP_PCT * ATR_TO_TP_SANITY_FACTOR
+         (previously hardcoded to 0.75, now env-controlled)
+    """
     if atr_pct < MIN_MOVE_PCT:
         return False, f"ATR_TOO_LOW atr%={atr_pct:.2f} < MIN_MOVE_PCT={MIN_MOVE_PCT:.2f}"
 
@@ -177,8 +191,12 @@ def _edge_ok(atr_pct: float) -> Tuple[bool, str]:
             f"< MIN_NET_PROFIT_PCT={MIN_NET_PROFIT_PCT:.2f}"
         )
 
-    if atr_pct < (assumed_gross_edge * 0.75):
-        return False, f"ATR_BELOW_TP atr%={atr_pct:.2f} < 0.75*TP_PCT={assumed_gross_edge*0.75:.2f}"
+    min_atr_for_tp = assumed_gross_edge * ATR_TO_TP_SANITY_FACTOR
+    if atr_pct < min_atr_for_tp:
+        return False, (
+            f"ATR_BELOW_TP atr%={atr_pct:.2f} < TP_PCT*ATR_TO_TP_SANITY_FACTOR={min_atr_for_tp:.2f} "
+            f"(TP_PCT={assumed_gross_edge:.2f} factor={ATR_TO_TP_SANITY_FACTOR:.2f})"
+        )
 
     return True, "OK"
 
@@ -199,14 +217,17 @@ def _get_outbox_path() -> str:
 
 
 def _tf_seconds(tf: str) -> int:
-    tf = tf.strip().lower()
-    if tf.endswith("m"):
-        return int(tf[:-1]) * 60
-    if tf.endswith("h"):
-        return int(tf[:-1]) * 3600
-    if tf.endswith("d"):
-        return int(tf[:-1]) * 86400
-    # fallback
+    tf = (tf or "").strip().lower()
+    try:
+        if tf.endswith("m"):
+            return max(1, int(tf[:-1])) * 60
+        if tf.endswith("h"):
+            return max(1, int(tf[:-1])) * 3600
+        if tf.endswith("d"):
+            return max(1, int(tf[:-1])) * 86400
+    except Exception:
+        pass
+    # fallback 15m
     return 900
 
 
@@ -232,28 +253,21 @@ def _build_exchange() -> ccxt.Exchange:
     if ex_name == "bybit":
         api_key = os.getenv("BYBIT_API_KEY", "").strip()
         api_secret = os.getenv("BYBIT_API_SECRET", "").strip()
-        ex = ccxt.bybit({
+        return ccxt.bybit({
             "enableRateLimit": True,
             "apiKey": api_key,
             "secret": api_secret,
-            "options": {
-                "defaultType": market_type,  # "spot" / "swap"
-            },
+            "options": {"defaultType": market_type},  # "spot" / "swap"
         })
-        return ex
 
-    # default binance
     api_key = os.getenv("BINANCE_API_KEY", "").strip()
     api_secret = os.getenv("BINANCE_API_SECRET", "").strip()
-    ex = ccxt.binance({
+    return ccxt.binance({
         "enableRateLimit": True,
         "apiKey": api_key,
         "secret": api_secret,
-        "options": {
-            "defaultType": market_type,
-        },
+        "options": {"defaultType": market_type},
     })
-    return ex
 
 
 EXCHANGE = _build_exchange()
@@ -265,7 +279,10 @@ EXCHANGE = _build_exchange()
 def _momentum(closes: List[float], n: int) -> float:
     if len(closes) < n + 1:
         return 0.0
-    return (closes[-1] / closes[-1 - n]) - 1.0
+    base = closes[-1 - n]
+    if base == 0:
+        return 0.0
+    return (closes[-1] / base) - 1.0
 
 
 def _slope_sma(closes: List[float]) -> float:
@@ -293,7 +310,7 @@ def _trend_strength(closes: List[float], use_ma: bool) -> float:
     """
     Returns 0..1
     If USE_MA_FILTERS: include last vs MA20 separation
-    Else: rely on slope + momentum (safer when MA removed)
+    Else: rely on slope + momentum
     """
     if len(closes) < 20:
         return 0.0
@@ -301,13 +318,10 @@ def _trend_strength(closes: List[float], use_ma: bool) -> float:
     last = closes[-1]
     prev = closes[-2]
     mom1 = _momentum(closes, 1)        # ~0.001 == 0.1%
-    mom10 = _momentum(closes, 10)
     slope = _slope_sma(closes)         # ~0.001 == +0.1%
     ups3 = _ups_count(closes, 3)
 
     base = 0.0
-
-    # momentum contribution
     base += 0.35 * (1.0 if last > prev else 0.0)
     base += 0.25 * max(0.0, min(1.0, (mom1 / 0.003)))     # 0.3% -> 1.0
     base += 0.20 * max(0.0, min(1.0, (slope / 0.003)))    # 0.3% -> 1.0
@@ -316,19 +330,18 @@ def _trend_strength(closes: List[float], use_ma: bool) -> float:
     if use_ma:
         ma20 = _sma(closes, 20)
         gap_pct = _pct(last, ma20)  # %
-        # add small MA alignment boost
         base += 0.15 * max(0.0, min(1.0, gap_pct / 0.6))   # 0.6% above MA -> +0.15
 
-    # clamp 0..1
     return max(0.0, min(1.0, base))
 
 
 def _structure_ok(closes: List[float], use_ma: bool) -> Tuple[bool, str]:
     """
-    Structure is intentionally stricter. If MA disabled, require:
+    If MA disabled, require:
       - SMA5 > SMA10
       - at least 2 up candles in last 3
       - mom10 not strongly negative
+      - last > prev
     """
     if len(closes) < 20:
         return False, "len<20"
@@ -349,7 +362,10 @@ def _structure_ok(closes: List[float], use_ma: bool) -> Tuple[bool, str]:
         ma20 = _sma(closes, 20)
         c_ma = last > ma20
         ok = c_last_prev and c_sma and c_ups and c_ma and c_mom10
-        reason = f"last>prev={int(c_last_prev)} sma5>sma10={int(c_sma)} ups3>=2={int(c_ups)} last>ma20={int(c_ma)} mom10_ok={int(c_mom10)}"
+        reason = (
+            f"last>prev={int(c_last_prev)} sma5>sma10={int(c_sma)} ups3>=2={int(c_ups)} "
+            f"last>ma20={int(c_ma)} mom10_ok={int(c_mom10)}"
+        )
         return ok, reason
 
     ok = c_last_prev and c_sma and c_ups and c_mom10
@@ -360,8 +376,7 @@ def _structure_ok(closes: List[float], use_ma: bool) -> Tuple[bool, str]:
 def _volume_score(vols: List[float]) -> Tuple[float, float]:
     """
     Return (vol_score 0..1, vRatio)
-    FIX: your old mapping was too harsh (ratio/2).
-    Now: score ~= vRatio clamped 0..1 (so 0.80 stays 0.80 and can pass vol_th=0.46)
+    score ~= vRatio clamped 0..1 (so 0.80 stays 0.80 and can pass vol_th=0.46)
     """
     if len(vols) < 20:
         return 0.0, 0.0
@@ -419,18 +434,17 @@ def generate_signal() -> Optional[Dict[str, Any]]:
     for symbol in SYMBOLS:
         active_oco = _has_active_oco(symbol)
 
-        # fetch
         try:
-            t0 = time.time()
             ohlcv = EXCHANGE.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=CANDLE_LIMIT)
-            dt_ms = int((time.time() - t0) * 1000)
         except Exception as e:
             logger.exception(f"[GEN] FETCH_FAIL | symbol={symbol} tf={TIMEFRAME} err={e}")
             continue
 
         if not ohlcv or len(ohlcv) < 30:
             if GEN_LOG_EVERY_TICK:
-                logger.info(f"[GEN] NO_SIGNAL | symbol={symbol} reason=not_enough_candles got={len(ohlcv) if ohlcv else 0} need>=30")
+                logger.info(
+                    f"[GEN] NO_SIGNAL | symbol={symbol} reason=not_enough_candles got={len(ohlcv) if ohlcv else 0} need>=30"
+                )
             continue
 
         ohlcv, dropped = _drop_unclosed_candle(ohlcv, TIMEFRAME)
@@ -481,23 +495,32 @@ def generate_signal() -> Optional[Dict[str, Any]]:
                 f"dropped_last_candle={dropped} outbox={outbox_path}"
             )
 
-            # deep diag
             mom1 = _momentum(closes, 1)
             mom10 = _momentum(closes, 10)
             slope = _slope_sma(closes)
             ups3 = _ups_count(closes, 3)
-            s5 = _sma(closes, 5)
-            s10 = _sma(closes, 10)
             v5 = sum(vols[-5:]) / 5.0 if len(vols) >= 5 else 0.0
             v20 = sum(vols[-20:]) / 20.0 if len(vols) >= 20 else 0.0
 
-            logger.info(
-                f"[GEN] DIAG | symbol={symbol} trend={trend:.3f} conf={conf:.3f} struct={struct_ok} "
-                f"vol_score={vol_score:.3f} struct_reason={struct_reason} "
-                f"mom1={mom1:.6f} mom10={mom10:.6f} slope={slope:.6f} ups3={ups3} "
-                f"sma5={s5:.6f} sma10={s10:.6f} v5={v5:.3f} v20={v20:.3f} vRatio={v_ratio:.3f} "
-                f"use_ma={USE_MA_FILTERS}"
-            )
+            if USE_MA_FILTERS:
+                s5 = _sma(closes, 5)
+                s10 = _sma(closes, 10)
+                ma20 = _sma(closes, 20)
+                ma_gap_abs = abs(_pct(last, ma20))
+                logger.info(
+                    f"[GEN] DIAG | symbol={symbol} trend={trend:.3f} conf={conf:.3f} struct={struct_ok} "
+                    f"vol_score={vol_score:.3f} struct_reason={struct_reason} "
+                    f"mom1={mom1:.6f} mom10={mom10:.6f} slope={slope:.6f} ups3={ups3} "
+                    f"sma5={s5:.6f} sma10={s10:.6f} ma_gap%={ma_gap_abs:.3f} "
+                    f"v5={v5:.3f} v20={v20:.3f} vRatio={v_ratio:.3f} use_ma={USE_MA_FILTERS}"
+                )
+            else:
+                logger.info(
+                    f"[GEN] DIAG | symbol={symbol} trend={trend:.3f} conf={conf:.3f} struct={struct_ok} "
+                    f"vol_score={vol_score:.3f} struct_reason={struct_reason} "
+                    f"mom1={mom1:.6f} mom10={mom10:.6f} slope={slope:.6f} ups3={ups3} "
+                    f"v5={v5:.3f} v20={v20:.3f} vRatio={v_ratio:.3f} use_ma={USE_MA_FILTERS}"
+                )
 
         # Protective SELL if active OCO and risk is KILL
         if active_oco and risk == "KILL":
@@ -536,12 +559,16 @@ def generate_signal() -> Optional[Dict[str, Any]]:
             ma_gap_abs = abs(_pct(last, ma20))
             if ma_gap_abs < MA_GAP_PCT:
                 if GEN_DEBUG:
-                    logger.info(f"[GEN] BLOCKED_BY_MA_GAP | symbol={symbol} gap%={ma_gap_abs:.3f} < MA_GAP_PCT={MA_GAP_PCT:.3f}")
+                    logger.info(
+                        f"[GEN] BLOCKED_BY_MA_GAP | symbol={symbol} gap%={ma_gap_abs:.3f} < MA_GAP_PCT={MA_GAP_PCT:.3f}"
+                    )
                 continue
 
         if conf < BUY_CONFIDENCE_MIN:
             if GEN_DEBUG:
-                logger.info(f"[GEN] BLOCKED_BY_CONF | symbol={symbol} conf={conf:.3f} < BUY_CONFIDENCE_MIN={BUY_CONFIDENCE_MIN:.3f}")
+                logger.info(
+                    f"[GEN] BLOCKED_BY_CONF | symbol={symbol} conf={conf:.3f} < BUY_CONFIDENCE_MIN={BUY_CONFIDENCE_MIN:.3f}"
+                )
             continue
 
         ok_edge, edge_reason = _edge_ok(atrp)
