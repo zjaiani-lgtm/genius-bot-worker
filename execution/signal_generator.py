@@ -23,27 +23,18 @@ ALLOW_LIVE_SIGNALS = os.getenv("ALLOW_LIVE_SIGNALS", "false").strip().lower() ==
 # USDT per trade (prevents NOTIONAL issues when you size in quote)
 BOT_QUOTE_PER_TRADE = float(os.getenv("BOT_QUOTE_PER_TRADE", "15"))
 
-# ---- Risk/Edge gates (these were previously only in Render envs, but not enforced in code) ----
-# Minimum ATR% required to even consider entries on this timeframe.
+# ---- Risk/Edge gates ----
 MIN_MOVE_PCT = float(os.getenv("MIN_MOVE_PCT", "0.60"))
 
-# Minimum absolute distance of price from MA20 (in %) to avoid "chop" entries.
+# NOTE: MA was removed from this generator. MA_GAP_PCT is kept for backward compatibility,
+# but it is NOT used anymore.
 MA_GAP_PCT = float(os.getenv("MA_GAP_PCT", "0.15"))
 
-# If your core confidence is below this, we skip (extra guard on top of Excel).
 BUY_CONFIDENCE_MIN = float(os.getenv("BUY_CONFIDENCE_MIN", "0.70"))
 
-# Expected round-trip cost model (VERY important for micro-scalps)
-# Example: taker 0.10% in + 0.10% out => 0.20%. If you are mostly maker, reduce this.
 ESTIMATED_ROUNDTRIP_FEE_PCT = float(os.getenv("ESTIMATED_ROUNDTRIP_FEE_PCT", "0.20"))
-
-# Spread + slippage safety buffer (symbol dependent). Keep conservative for LIVE.
 ESTIMATED_SLIPPAGE_PCT = float(os.getenv("ESTIMATED_SLIPPAGE_PCT", "0.15"))
-
-# Strategy target/edge. We use TP_PCT as the "gross edge" assumption.
 TP_PCT = float(os.getenv("TP_PCT", "1.3"))
-
-# Minimum required net profit AFTER fees+slippage.
 MIN_NET_PROFIT_PCT = float(os.getenv("MIN_NET_PROFIT_PCT", "0.60"))
 
 BLOCK_SIGNALS_WHEN_ACTIVE_OCO = os.getenv("BLOCK_SIGNALS_WHEN_ACTIVE_OCO", "true").strip().lower() == "true"
@@ -53,8 +44,6 @@ GEN_LOG_EVERY_TICK = os.getenv("GEN_LOG_EVERY_TICK", "true").strip().lower() == 
 
 # ---- Excel model path (sanitized) ----
 EXCEL_MODEL_PATH = os.getenv("EXCEL_MODEL_PATH", "/var/data/DYZEN_CAPITAL_OS_AI_LIVE_CORE_READY.xlsx").strip()
-
-# sanitize common misconfig like: EXCEL_MODEL_PATH=EXCEL_MODEL_PATH=/opt/render/...xlsx
 if EXCEL_MODEL_PATH.lower().startswith("excel_model_path="):
     EXCEL_MODEL_PATH = EXCEL_MODEL_PATH.split("=", 1)[1].strip()
 
@@ -62,7 +51,6 @@ _last_emit_ts: float = 0.0
 _last_signature: Optional[Tuple[str, str]] = None  # reserved (if you later want de-dup)
 
 # ---- Exchange (Binance) ----
-# For public fetch_ohlcv, keys are not required, but for LIVE execution elsewhere they usually are.
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "").strip()
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "").strip()
 
@@ -72,7 +60,6 @@ EXCHANGE = ccxt.binance({
     "secret": BINANCE_API_SECRET,
 })
 
-# Load Excel core once
 _CORE: Optional[ExcelLiveCore] = None
 
 
@@ -87,7 +74,7 @@ def _parse_symbols() -> List[str]:
     if not raw:
         raw = os.getenv("BOT_SYMBOL", "BTC/USDT").strip()
 
-    syms = []
+    syms: List[str] = []
     for s in raw.split(","):
         s = s.strip()
         if not s:
@@ -109,12 +96,6 @@ def _has_active_oco(symbol: str) -> bool:
 
 
 def _resolve_excel_path(env_path: str) -> str:
-    """
-    Resolve excel file path robustly:
-    - uses env_path if exists
-    - falls back to /var/data and /opt/render assets
-    - provides strong debug context if nothing found
-    """
     candidates = [
         env_path,
         "/var/data/DYZEN_CAPITAL_OS_AI_LIVE_CORE_READY.xlsx",
@@ -125,7 +106,6 @@ def _resolve_excel_path(env_path: str) -> str:
         if p and os.path.exists(p):
             return p
 
-    # strong debug info
     try:
         assets_list = os.listdir("/opt/render/project/src/assets")
     except Exception:
@@ -171,7 +151,7 @@ def _sma(vals: List[float], n: int) -> float:
 def _atr_pct(ohlcv: List[List[float]], n: int = 14) -> float:
     if len(ohlcv) < n + 1:
         return 0.0
-    trs = []
+    trs: List[float] = []
     for i in range(-n, 0):
         high = float(ohlcv[i][2])
         low = float(ohlcv[i][3])
@@ -184,7 +164,6 @@ def _atr_pct(ohlcv: List[List[float]], n: int = 14) -> float:
 
 
 def _vol_regime(atr_pct: float) -> str:
-    # tweakable but sane defaults:
     if atr_pct >= 2.0:
         return "EXTREME"
     if atr_pct <= 0.30:
@@ -193,16 +172,6 @@ def _vol_regime(atr_pct: float) -> str:
 
 
 def _edge_ok(atr_pct: float) -> Tuple[bool, str]:
-    """Fee-aware edge gate.
-
-    We only take trades if the assumed gross edge (TP_PCT) can pay:
-      - estimated round-trip trading fees
-      - estimated slippage/spread
-      - and still leave MIN_NET_PROFIT_PCT net.
-
-    Also requires ATR% to be high enough to realistically reach TP on this TF.
-    """
-    # Feasibility: if ATR is below TP, hitting TP is less likely.
     if atr_pct < MIN_MOVE_PCT:
         return False, f"ATR_TOO_LOW atr%={atr_pct:.2f} < MIN_MOVE_PCT={MIN_MOVE_PCT:.2f}"
 
@@ -217,30 +186,83 @@ def _edge_ok(atr_pct: float) -> Tuple[bool, str]:
             f"< MIN_NET_PROFIT_PCT={MIN_NET_PROFIT_PCT:.2f}"
         )
 
-    # Additional sanity: ATR should at least be in the ballpark of TP.
     if atr_pct < (assumed_gross_edge * 0.75):
         return False, f"ATR_BELOW_TP atr%={atr_pct:.2f} < 0.75*TP_PCT={assumed_gross_edge*0.75:.2f}"
 
     return True, "OK"
 
 
-def _trend_strength(last: float, ma20: float) -> float:
-    # normalize separation above MA20 into 0..1
-    gap_pct = _pct(last, ma20)  # last vs ma20
-    # map: 0% -> 0.5, 0.4% -> ~0.7, 1% -> ~0.9
-    x = (gap_pct / 1.0)  # 1% scale
-    return max(0.0, min(1.0, 0.5 + (x * 0.4)))
+# -----------------------------
+# MA REMOVED: NEW TREND / STRUCT / CONF
+# -----------------------------
+
+def _trend_strength(closes: List[float]) -> float:
+    """
+    MA-free trend strength using:
+    - momentum over last N bars
+    - slope proxy: short SMA vs longer SMA
+    Output normalized to 0..1.
+    """
+    if len(closes) < 21:
+        return 0.0
+
+    last = closes[-1]
+    prev = closes[-2]
+    if prev <= 0 or last <= 0:
+        return 0.0
+
+    # momentum: last vs prev (very short)
+    mom1 = (last - prev) / prev  # ~0.001 = 0.1%
+
+    # swing momentum: last vs 10 bars ago
+    base = closes[-11]
+    mom10 = (last - base) / base if base else 0.0
+
+    # slope proxy: SMA(5) vs SMA(20)
+    sma5 = _sma(closes, 5)
+    sma20 = _sma(closes, 20)
+    slope = (sma5 - sma20) / sma20 if sma20 else 0.0
+
+    # Normalize each component to 0..1 with conservative caps
+    # 0% => 0.5, +0.5% => ~0.8, -0.5% => ~0.2
+    def _norm(x: float, scale: float) -> float:
+        return max(0.0, min(1.0, 0.5 + (x / scale)))
+
+    n_mom1 = _norm(mom1, 0.005)     # 0.5% scale
+    n_mom10 = _norm(mom10, 0.010)   # 1% scale
+    n_slope = _norm(slope, 0.005)   # 0.5% scale
+
+    # weighted blend
+    trend = (0.45 * n_slope) + (0.35 * n_mom10) + (0.20 * n_mom1)
+    return max(0.0, min(1.0, trend))
 
 
 def _structure_ok(closes: List[float]) -> bool:
-    if len(closes) < 10:
+    """
+    MA-free structure:
+    - last > prev
+    - SMA(5) > SMA(10) (local up-structure)
+    - last 3 bars show at least 2 green closes (anti-chop)
+    """
+    if len(closes) < 12:
         return False
+
     last = closes[-1]
-    ma20 = _sma(closes, 20)
     prev = closes[-2]
-    last5 = closes[-5:]
-    last10 = closes[-10:]
-    return (last > ma20) and (last > prev) and (sum(last5) / 5.0 > sum(last10) / 10.0)
+    if not (last > prev):
+        return False
+
+    sma5 = _sma(closes, 5)
+    sma10 = _sma(closes, 10)
+    if not (sma5 > sma10):
+        return False
+
+    # last 3 closes: count "up" bars
+    ups = 0
+    for i in range(-3, 0):
+        if closes[i] > closes[i - 1]:
+            ups += 1
+    return ups >= 2
 
 
 def _volume_score(vols: List[float]) -> float:
@@ -250,27 +272,35 @@ def _volume_score(vols: List[float]) -> float:
     v_avg = sum(vols[-20:]) / 20.0
     if v_avg <= 0:
         return 0.0
-    ratio = v_last / v_avg  # 1.0 is normal
-    # normalize: 0..2 mapped to 0..1
+    ratio = v_last / v_avg
     return max(0.0, min(1.0, ratio / 2.0))
 
 
 def _confidence_score(closes: List[float], ohlcv: List[List[float]]) -> float:
-    # confidence combines trend alignment + momentum + volatility sanity
+    """
+    MA-free confidence:
+    - cond_mom: last > prev
+    - cond_struct: SMA(5) > SMA(10)
+    - cond_atr: atr not extreme
+    """
+    if len(closes) < 12:
+        return 0.0
+
     last = closes[-1]
     prev = closes[-2]
-    ma20 = _sma(closes, 20)
     atrp = _atr_pct(ohlcv, 14)
 
-    cond1 = 1.0 if last > ma20 else 0.0
-    cond2 = 1.0 if last > prev else 0.0
-    cond3 = 1.0 if atrp < 2.0 else 0.0  # avoid extreme
+    sma5 = _sma(closes, 5)
+    sma10 = _sma(closes, 10)
 
-    return (0.45 * cond1) + (0.35 * cond2) + (0.20 * cond3)
+    cond_mom = 1.0 if last > prev else 0.0
+    cond_struct = 1.0 if sma5 > sma10 else 0.0
+    cond_atr = 1.0 if atrp < 2.0 else 0.0
+
+    return (0.45 * cond_struct) + (0.35 * cond_mom) + (0.20 * cond_atr)
 
 
 def _risk_state(vol_regime: str, ai_score: float) -> str:
-    # minimal protective logic:
     if vol_regime == "EXTREME":
         return "KILL"
     if ai_score < 0.45:
@@ -290,7 +320,6 @@ def _emit(signal: Dict[str, Any], outbox_path: str) -> None:
 
 
 def _get_outbox_path() -> str:
-    # supports both env names
     return (
         os.getenv("OUTBOX_PATH")
         or os.getenv("SIGNAL_OUTBOX_PATH")
@@ -300,7 +329,7 @@ def _get_outbox_path() -> str:
 
 def generate_signal() -> Optional[Dict[str, Any]]:
     """
-    Excel Live Core based generator:
+    Excel Live Core based generator (MA REMOVED):
     - If no active OCO: emits TRADE only when final_trade_decision == EXECUTE.
     - If active OCO: can emit SELL if risk_state == KILL (protective override).
     """
@@ -332,11 +361,12 @@ def generate_signal() -> Optional[Dict[str, Any]]:
         closes = [float(c[4]) for c in ohlcv]
         vols = [float(c[5]) for c in ohlcv]
         last = closes[-1]
-        ma20 = _sma(closes, 20)
+        prev = closes[-2]
+
         atrp = _atr_pct(ohlcv, 14)
         vol_reg = _vol_regime(atrp)
 
-        trend = _trend_strength(last, ma20)
+        trend = _trend_strength(closes)
         struct_ok = _structure_ok(closes)
         vol_score = _volume_score(vols)
         conf = _confidence_score(closes, ohlcv)
@@ -370,7 +400,14 @@ def generate_signal() -> Optional[Dict[str, Any]]:
                 f"[GEN] CORE_DECISION | symbol={symbol} "
                 f"ai={decision['ai_score']:.3f} macro={decision['macro_gate']} strat={decision['active_strategy']} "
                 f"final={decision['final_trade_decision']} risk={risk} volReg={vol_reg} atr%={atrp:.2f} "
-                f"last={last:.6f} ma20={ma20:.6f} outbox={outbox_path}"
+                f"last={last:.6f} prev={prev:.6f} outbox={outbox_path}"
+            )
+            logger.info(
+                f"[GEN] DIAG | symbol={symbol} "
+                f"last={last:.6f} prev={prev:.6f} atr%={atrp:.2f} volReg={vol_reg} "
+                f"trend={trend:.3f} conf={conf:.3f} struct={struct_ok} vol_score={vol_score:.3f} "
+                f"macro={decision['macro_gate']} active={decision['active_strategy']} final={decision['final_trade_decision']} "
+                f"ai={decision['ai_score']:.3f}"
             )
 
         # Protective SELL if active OCO and risk is KILL
@@ -396,7 +433,7 @@ def generate_signal() -> Optional[Dict[str, Any]]:
             _emit(sig, outbox_path)
             return sig
 
-        # If active OCO → we do not open new TRADE (risk-first)
+        # If active OCO → we do not open new TRADE
         if active_oco and BLOCK_SIGNALS_WHEN_ACTIVE_OCO:
             continue
 
@@ -408,16 +445,7 @@ def generate_signal() -> Optional[Dict[str, Any]]:
         # EXTRA LIVE GUARDS (fee-aware)
         # -----------------------------
 
-        # 1) Avoid chop: require distance from MA
-        ma_gap_abs = abs(_pct(last, ma20))
-        if ma_gap_abs < MA_GAP_PCT:
-            if GEN_DEBUG:
-                logger.info(
-                    f"[GEN] BLOCKED_BY_MA_GAP | symbol={symbol} gap%={ma_gap_abs:.3f} < MA_GAP_PCT={MA_GAP_PCT:.3f}"
-                )
-            continue
-
-        # 2) Confidence floor (extra check)
+        # 1) Confidence floor (extra check)
         if conf < BUY_CONFIDENCE_MIN:
             if GEN_DEBUG:
                 logger.info(
@@ -425,7 +453,7 @@ def generate_signal() -> Optional[Dict[str, Any]]:
                 )
             continue
 
-        # 3) Fee-aware edge gate
+        # 2) Fee-aware edge gate
         ok_edge, edge_reason = _edge_ok(atrp)
         if not ok_edge:
             if GEN_DEBUG:
@@ -438,7 +466,6 @@ def generate_signal() -> Optional[Dict[str, Any]]:
                 logger.info(f"[GEN] BLOCKED_BY_ENV | symbol={symbol} reason=ALLOW_LIVE_SIGNALS=false")
             continue
 
-        # build TRADE signal
         signal_id = str(uuid.uuid4())
         sig = {
             "signal_id": signal_id,
@@ -454,7 +481,7 @@ def generate_signal() -> Optional[Dict[str, Any]]:
                 "symbol": symbol,
                 "direction": "LONG",
                 "entry": {"type": "MARKET"},
-                "quote_amount": BOT_QUOTE_PER_TRADE,  # size in USDT (helps NOTIONAL)
+                "quote_amount": BOT_QUOTE_PER_TRADE,
             }
         }
 
