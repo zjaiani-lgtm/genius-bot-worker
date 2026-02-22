@@ -14,7 +14,10 @@ from execution.excel_live_core import ExcelLiveCore, CoreInputs
 
 logger = logging.getLogger("gbm")
 
-TIMEFRAME = os.getenv("BOT_TIMEFRAME", "15m")
+# -----------------------------
+# ENV
+# -----------------------------
+TIMEFRAME = os.getenv("BOT_TIMEFRAME", "15m").strip()
 CANDLE_LIMIT = int(os.getenv("BOT_CANDLE_LIMIT", "80"))
 COOLDOWN_SECONDS = int(os.getenv("BOT_SIGNAL_COOLDOWN_SECONDS", "180"))
 
@@ -22,45 +25,35 @@ ALLOW_LIVE_SIGNALS = os.getenv("ALLOW_LIVE_SIGNALS", "false").strip().lower() ==
 
 BOT_QUOTE_PER_TRADE = float(os.getenv("BOT_QUOTE_PER_TRADE", "15"))
 
-# ---- Risk/Edge gates ----
+# Fee-aware edge gate
 MIN_MOVE_PCT = float(os.getenv("MIN_MOVE_PCT", "0.60"))
-
-# MA removed. Keep env for compatibility; not used.
-MA_GAP_PCT = float(os.getenv("MA_GAP_PCT", "0.15"))
-
-BUY_CONFIDENCE_MIN = float(os.getenv("BUY_CONFIDENCE_MIN", "0.70"))
-
 ESTIMATED_ROUNDTRIP_FEE_PCT = float(os.getenv("ESTIMATED_ROUNDTRIP_FEE_PCT", "0.20"))
 ESTIMATED_SLIPPAGE_PCT = float(os.getenv("ESTIMATED_SLIPPAGE_PCT", "0.15"))
 TP_PCT = float(os.getenv("TP_PCT", "1.3"))
 MIN_NET_PROFIT_PCT = float(os.getenv("MIN_NET_PROFIT_PCT", "0.60"))
+
+# Optional MA filters (FULL OFF switch)
+USE_MA_FILTERS = os.getenv("USE_MA_FILTERS", "true").strip().lower() == "true"
+MA_GAP_PCT = float(os.getenv("MA_GAP_PCT", "0.15"))  # used only if USE_MA_FILTERS=true
+
+# Extra confidence guard (on top of Excel)
+BUY_CONFIDENCE_MIN = float(os.getenv("BUY_CONFIDENCE_MIN", "0.70"))
 
 BLOCK_SIGNALS_WHEN_ACTIVE_OCO = os.getenv("BLOCK_SIGNALS_WHEN_ACTIVE_OCO", "true").strip().lower() == "true"
 
 GEN_DEBUG = os.getenv("GEN_DEBUG", "true").strip().lower() == "true"
 GEN_LOG_EVERY_TICK = os.getenv("GEN_LOG_EVERY_TICK", "true").strip().lower() == "true"
 
-# ---- Excel model path (sanitized) ----
+# Excel model path
 EXCEL_MODEL_PATH = os.getenv("EXCEL_MODEL_PATH", "/var/data/DYZEN_CAPITAL_OS_AI_LIVE_CORE_READY.xlsx").strip()
 if EXCEL_MODEL_PATH.lower().startswith("excel_model_path="):
     EXCEL_MODEL_PATH = EXCEL_MODEL_PATH.split("=", 1)[1].strip()
 
 _last_emit_ts: float = 0.0
-_last_signature: Optional[Tuple[str, str]] = None
 
-# ---- Exchange (public fetch works without keys) ----
-BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "").strip()
-BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "").strip()
-
-EXCHANGE = ccxt.binance({
-    "enableRateLimit": True,
-    "apiKey": BINANCE_API_KEY,
-    "secret": BINANCE_API_SECRET,
-})
-
-_CORE: Optional[ExcelLiveCore] = None
-
-
+# -----------------------------
+# HELPERS
+# -----------------------------
 def _now_utc_iso() -> str:
     return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
@@ -72,7 +65,7 @@ def _parse_symbols() -> List[str]:
     if not raw:
         raw = os.getenv("BOT_SYMBOL", "BTC/USDT").strip()
 
-    syms: List[str] = []
+    syms = []
     for s in raw.split(","):
         s = s.strip()
         if not s:
@@ -106,7 +99,6 @@ def _resolve_excel_path(env_path: str) -> str:
         assets_list = os.listdir("/opt/render/project/src/assets")
     except Exception:
         assets_list = []
-
     try:
         var_data_list = os.listdir("/var/data")
     except Exception:
@@ -115,6 +107,9 @@ def _resolve_excel_path(env_path: str) -> str:
     raise FileNotFoundError(
         f"EXCEL_MODEL_NOT_FOUND | env={env_path} | assets={assets_list} | var_data={var_data_list}"
     )
+
+
+_CORE: Optional[ExcelLiveCore] = None
 
 
 def _core() -> ExcelLiveCore:
@@ -136,8 +131,10 @@ def _pct(a: float, b: float) -> float:
 
 
 def _sma(vals: List[float], n: int) -> float:
+    if not vals:
+        return 0.0
     if len(vals) < n:
-        return sum(vals) / max(1, len(vals))
+        return sum(vals) / len(vals)
     w = vals[-n:]
     return sum(w) / n
 
@@ -145,7 +142,7 @@ def _sma(vals: List[float], n: int) -> float:
 def _atr_pct(ohlcv: List[List[float]], n: int = 14) -> float:
     if len(ohlcv) < n + 1:
         return 0.0
-    trs: List[float] = []
+    trs = []
     for i in range(-n, 0):
         high = float(ohlcv[i][2])
         low = float(ohlcv[i][3])
@@ -186,143 +183,6 @@ def _edge_ok(atr_pct: float) -> Tuple[bool, str]:
     return True, "OK"
 
 
-# -----------------------------
-# MA REMOVED: NEW TREND / STRUCT / CONF
-# -----------------------------
-
-def _trend_strength_components(closes: List[float]) -> Tuple[float, Dict[str, float]]:
-    """
-    MA-free trend strength using:
-    - momentum (1 bar, 10 bars)
-    - slope proxy via SMA(5) vs SMA(20)
-    Returns (trend_0_1, debug_dict)
-    """
-    if len(closes) < 21:
-        return 0.0, {"reason": 0.0}
-
-    last = closes[-1]
-    prev = closes[-2]
-    if prev <= 0 or last <= 0:
-        return 0.0, {"reason": -1.0}
-
-    mom1 = (last - prev) / prev
-
-    base = closes[-11]
-    mom10 = (last - base) / base if base else 0.0
-
-    sma5 = _sma(closes, 5)
-    sma20 = _sma(closes, 20)
-    slope = (sma5 - sma20) / sma20 if sma20 else 0.0
-
-    def _norm(x: float, scale: float) -> float:
-        return max(0.0, min(1.0, 0.5 + (x / scale)))
-
-    # NOTE: slightly more "sensitive" scales than before to avoid trend getting stuck < threshold
-    n_mom1 = _norm(mom1, 0.004)     # 0.4% scale
-    n_mom10 = _norm(mom10, 0.008)   # 0.8% scale
-    n_slope = _norm(slope, 0.004)   # 0.4% scale
-
-    trend = (0.45 * n_slope) + (0.35 * n_mom10) + (0.20 * n_mom1)
-    trend = max(0.0, min(1.0, trend))
-
-    dbg = {
-        "mom1": mom1,
-        "mom10": mom10,
-        "sma5": sma5,
-        "sma20": sma20,
-        "slope": slope,
-        "n_mom1": n_mom1,
-        "n_mom10": n_mom10,
-        "n_slope": n_slope,
-        "trend": trend,
-    }
-    return trend, dbg
-
-
-def _structure_ok(closes: List[float]) -> Tuple[bool, str, Dict[str, float]]:
-    """
-    MA-free structure:
-    - last > prev
-    - SMA(5) > SMA(10)
-    - last 3 bars show at least 2 green closes
-    """
-    if len(closes) < 12:
-        return False, "len<12", {}
-
-    last = closes[-1]
-    prev = closes[-2]
-
-    sma5 = _sma(closes, 5)
-    sma10 = _sma(closes, 10)
-
-    ups = 0
-    for i in range(-3, 0):
-        if closes[i] > closes[i - 1]:
-            ups += 1
-
-    ok = (last > prev) and (sma5 > sma10) and (ups >= 2)
-    reason = "OK" if ok else f"last>prev={int(last>prev)} sma5>sma10={int(sma5>sma10)} ups={ups}"
-    dbg = {"sma5": sma5, "sma10": sma10, "ups3": float(ups)}
-    return ok, reason, dbg
-
-
-def _volume_score(vols: List[float]) -> Tuple[float, Dict[str, float]]:
-    """
-    IMPORTANT FIX:
-    - Use last CLOSED volumes (exclude potentially-incomplete current candle)
-    - Use avg(last5) vs avg(last20) (more stable than last1)
-    """
-    if len(vols) < 25:
-        return 0.0, {"reason": 0.0}
-
-    v5 = sum(vols[-5:]) / 5.0
-    v20 = sum(vols[-20:]) / 20.0
-    if v20 <= 0:
-        return 0.0, {"v5": v5, "v20": v20, "ratio": 0.0}
-
-    ratio = v5 / v20  # 1.0 is "normal"
-    # map ratio: 0.7 -> 0.0, 1.0 -> 0.5, 1.4 -> 1.0
-    score = (ratio - 0.7) / (1.4 - 0.7)
-    score = max(0.0, min(1.0, score))
-
-    return score, {"v5": v5, "v20": v20, "ratio": ratio, "vol_score": score}
-
-
-def _confidence_score(closes: List[float], ohlcv: List[List[float]]) -> Tuple[float, Dict[str, float]]:
-    if len(closes) < 12:
-        return 0.0, {"reason": 0.0}
-
-    last = closes[-1]
-    prev = closes[-2]
-    atrp = _atr_pct(ohlcv, 14)
-
-    sma5 = _sma(closes, 5)
-    sma10 = _sma(closes, 10)
-
-    cond_mom = 1.0 if last > prev else 0.0
-    cond_struct = 1.0 if sma5 > sma10 else 0.0
-    cond_atr = 1.0 if atrp < 2.0 else 0.0
-
-    conf = (0.45 * cond_struct) + (0.35 * cond_mom) + (0.20 * cond_atr)
-    dbg = {
-        "cond_mom": cond_mom,
-        "cond_struct": cond_struct,
-        "cond_atr": cond_atr,
-        "sma5": sma5,
-        "sma10": sma10,
-        "conf": conf,
-    }
-    return conf, dbg
-
-
-def _risk_state(vol_regime: str, ai_score: float) -> str:
-    if vol_regime == "EXTREME":
-        return "KILL"
-    if ai_score < 0.45:
-        return "REDUCE"
-    return "OK"
-
-
 def _cooldown_ok() -> bool:
     global _last_emit_ts
     return (time.time() - _last_emit_ts) >= COOLDOWN_SECONDS
@@ -338,15 +198,214 @@ def _get_outbox_path() -> str:
     return os.getenv("OUTBOX_PATH") or os.getenv("SIGNAL_OUTBOX_PATH") or "/var/data/signal_outbox.json"
 
 
-def _strip_incomplete_candle(ohlcv: List[List[float]]) -> Tuple[List[List[float]], bool]:
-    """
-    Fix for low volume/unstable last candle:
-    - If we are polling frequently, ohlcv[-1] is the currently-forming candle.
-    - We compute indicators on CLOSED candles only (drop the last one).
-    """
-    if not ohlcv or len(ohlcv) < 3:
+def _tf_seconds(tf: str) -> int:
+    tf = tf.strip().lower()
+    if tf.endswith("m"):
+        return int(tf[:-1]) * 60
+    if tf.endswith("h"):
+        return int(tf[:-1]) * 3600
+    if tf.endswith("d"):
+        return int(tf[:-1]) * 86400
+    # fallback
+    return 900
+
+
+def _drop_unclosed_candle(ohlcv: List[List[float]], timeframe: str) -> Tuple[List[List[float]], bool]:
+    if not ohlcv:
         return ohlcv, False
-    return ohlcv[:-1], True
+    last_ts_ms = int(ohlcv[-1][0])
+    now_ms = int(time.time() * 1000)
+    tf_ms = _tf_seconds(timeframe) * 1000
+    # if last candle start is too recent, it's likely still forming
+    if now_ms - last_ts_ms < tf_ms:
+        return ohlcv[:-1], True
+    return ohlcv, False
+
+
+# -----------------------------
+# EXCHANGE BUILDER
+# -----------------------------
+def _build_exchange() -> ccxt.Exchange:
+    ex_name = os.getenv("EXCHANGE", "binance").strip().lower()
+    market_type = os.getenv("MARKET_TYPE", "spot").strip().lower()
+
+    if ex_name == "bybit":
+        api_key = os.getenv("BYBIT_API_KEY", "").strip()
+        api_secret = os.getenv("BYBIT_API_SECRET", "").strip()
+        ex = ccxt.bybit({
+            "enableRateLimit": True,
+            "apiKey": api_key,
+            "secret": api_secret,
+            "options": {
+                "defaultType": market_type,  # "spot" / "swap"
+            },
+        })
+        return ex
+
+    # default binance
+    api_key = os.getenv("BINANCE_API_KEY", "").strip()
+    api_secret = os.getenv("BINANCE_API_SECRET", "").strip()
+    ex = ccxt.binance({
+        "enableRateLimit": True,
+        "apiKey": api_key,
+        "secret": api_secret,
+        "options": {
+            "defaultType": market_type,
+        },
+    })
+    return ex
+
+
+EXCHANGE = _build_exchange()
+
+
+# -----------------------------
+# FEATURE CALCS (NO-MA READY)
+# -----------------------------
+def _momentum(closes: List[float], n: int) -> float:
+    if len(closes) < n + 1:
+        return 0.0
+    return (closes[-1] / closes[-1 - n]) - 1.0
+
+
+def _slope_sma(closes: List[float]) -> float:
+    # normalized slope: SMA5 vs SMA10
+    if len(closes) < 10:
+        return 0.0
+    s5 = _sma(closes, 5)
+    s10 = _sma(closes, 10)
+    if s10 == 0:
+        return 0.0
+    return (s5 / s10) - 1.0
+
+
+def _ups_count(closes: List[float], n: int) -> int:
+    if len(closes) < n + 1:
+        return 0
+    ups = 0
+    for i in range(-n, 0):
+        if closes[i] > closes[i - 1]:
+            ups += 1
+    return ups
+
+
+def _trend_strength(closes: List[float], use_ma: bool) -> float:
+    """
+    Returns 0..1
+    If USE_MA_FILTERS: include last vs MA20 separation
+    Else: rely on slope + momentum (safer when MA removed)
+    """
+    if len(closes) < 20:
+        return 0.0
+
+    last = closes[-1]
+    prev = closes[-2]
+    mom1 = _momentum(closes, 1)        # ~0.001 == 0.1%
+    mom10 = _momentum(closes, 10)
+    slope = _slope_sma(closes)         # ~0.001 == +0.1%
+    ups3 = _ups_count(closes, 3)
+
+    base = 0.0
+
+    # momentum contribution
+    base += 0.35 * (1.0 if last > prev else 0.0)
+    base += 0.25 * max(0.0, min(1.0, (mom1 / 0.003)))     # 0.3% -> 1.0
+    base += 0.20 * max(0.0, min(1.0, (slope / 0.003)))    # 0.3% -> 1.0
+    base += 0.20 * (ups3 / 3.0)
+
+    if use_ma:
+        ma20 = _sma(closes, 20)
+        gap_pct = _pct(last, ma20)  # %
+        # add small MA alignment boost
+        base += 0.15 * max(0.0, min(1.0, gap_pct / 0.6))   # 0.6% above MA -> +0.15
+
+    # clamp 0..1
+    return max(0.0, min(1.0, base))
+
+
+def _structure_ok(closes: List[float], use_ma: bool) -> Tuple[bool, str]:
+    """
+    Structure is intentionally stricter. If MA disabled, require:
+      - SMA5 > SMA10
+      - at least 2 up candles in last 3
+      - mom10 not strongly negative
+    """
+    if len(closes) < 20:
+        return False, "len<20"
+
+    last = closes[-1]
+    prev = closes[-2]
+    s5 = _sma(closes, 5)
+    s10 = _sma(closes, 10)
+    ups3 = _ups_count(closes, 3)
+    mom10 = _momentum(closes, 10)
+
+    c_last_prev = last > prev
+    c_sma = s5 > s10
+    c_ups = ups3 >= 2
+    c_mom10 = mom10 > -0.002  # not worse than -0.2% over 10 candles
+
+    if use_ma:
+        ma20 = _sma(closes, 20)
+        c_ma = last > ma20
+        ok = c_last_prev and c_sma and c_ups and c_ma and c_mom10
+        reason = f"last>prev={int(c_last_prev)} sma5>sma10={int(c_sma)} ups3>=2={int(c_ups)} last>ma20={int(c_ma)} mom10_ok={int(c_mom10)}"
+        return ok, reason
+
+    ok = c_last_prev and c_sma and c_ups and c_mom10
+    reason = f"last>prev={int(c_last_prev)} sma5>sma10={int(c_sma)} ups3>=2={int(c_ups)} mom10_ok={int(c_mom10)}"
+    return ok, reason
+
+
+def _volume_score(vols: List[float]) -> Tuple[float, float]:
+    """
+    Return (vol_score 0..1, vRatio)
+    FIX: your old mapping was too harsh (ratio/2).
+    Now: score ~= vRatio clamped 0..1 (so 0.80 stays 0.80 and can pass vol_th=0.46)
+    """
+    if len(vols) < 20:
+        return 0.0, 0.0
+    v_last = vols[-1]
+    v_avg = sum(vols[-20:]) / 20.0
+    if v_avg <= 0:
+        return 0.0, 0.0
+    v_ratio = v_last / v_avg  # 1.0 normal
+    score = max(0.0, min(1.0, v_ratio))
+    return score, v_ratio
+
+
+def _confidence_score(closes: List[float], ohlcv: List[List[float]], use_ma: bool) -> float:
+    """
+    Returns 0..1
+    If MA disabled: confidence mainly from last>prev + slope + non-extreme ATR
+    If MA enabled: include last>ma20 condition too
+    """
+    if len(closes) < 20 or len(ohlcv) < 20:
+        return 0.0
+
+    last = closes[-1]
+    prev = closes[-2]
+    atrp = _atr_pct(ohlcv, 14)
+    slope = _slope_sma(closes)
+
+    cond_last_prev = 1.0 if last > prev else 0.0
+    cond_atr = 1.0 if atrp < 2.0 else 0.0
+    cond_slope = max(0.0, min(1.0, slope / 0.003))  # 0.3% -> 1.0
+
+    if use_ma:
+        ma20 = _sma(closes, 20)
+        cond_ma = 1.0 if last > ma20 else 0.0
+        return (0.35 * cond_ma) + (0.35 * cond_last_prev) + (0.20 * cond_slope) + (0.10 * cond_atr)
+
+    return (0.45 * cond_last_prev) + (0.35 * cond_slope) + (0.20 * cond_atr)
+
+
+def _risk_state(vol_regime: str, ai_score: float) -> str:
+    if vol_regime == "EXTREME":
+        return "KILL"
+    if ai_score < 0.45:
+        return "REDUCE"
+    return "OK"
 
 
 def generate_signal() -> Optional[Dict[str, Any]]:
@@ -360,38 +419,38 @@ def generate_signal() -> Optional[Dict[str, Any]]:
     for symbol in SYMBOLS:
         active_oco = _has_active_oco(symbol)
 
+        # fetch
         try:
             t0 = time.time()
-            ohlcv_raw = EXCHANGE.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=CANDLE_LIMIT)
+            ohlcv = EXCHANGE.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=CANDLE_LIMIT)
             dt_ms = int((time.time() - t0) * 1000)
-            if GEN_DEBUG:
-                logger.info(f"[GEN] FETCH_OK | symbol={symbol} tf={TIMEFRAME} candles={len(ohlcv_raw) if ohlcv_raw else 0} dt={dt_ms}ms")
         except Exception as e:
             logger.exception(f"[GEN] FETCH_FAIL | symbol={symbol} tf={TIMEFRAME} err={e}")
             continue
 
-        if not ohlcv_raw or len(ohlcv_raw) < 30:
+        if not ohlcv or len(ohlcv) < 30:
             if GEN_LOG_EVERY_TICK:
-                logger.info(f"[GEN] NO_SIGNAL | symbol={symbol} reason=not_enough_candles got={len(ohlcv_raw) if ohlcv_raw else 0} need>=30")
+                logger.info(f"[GEN] NO_SIGNAL | symbol={symbol} reason=not_enough_candles got={len(ohlcv) if ohlcv else 0} need>=30")
             continue
 
-        ohlcv, dropped = _strip_incomplete_candle(ohlcv_raw)
+        ohlcv, dropped = _drop_unclosed_candle(ohlcv, TIMEFRAME)
         if len(ohlcv) < 30:
             continue
 
         closes = [float(c[4]) for c in ohlcv]
         vols = [float(c[5]) for c in ohlcv]
+
         last = closes[-1]
         prev = closes[-2]
-
         atrp = _atr_pct(ohlcv, 14)
         vol_reg = _vol_regime(atrp)
 
-        trend, trend_dbg = _trend_strength_components(closes)
-        struct_ok, struct_reason, struct_dbg = _structure_ok(closes)
-        vol_score, vol_dbg = _volume_score(vols)
-        conf, conf_dbg = _confidence_score(closes, ohlcv)
+        trend = _trend_strength(closes, USE_MA_FILTERS)
+        struct_ok, struct_reason = _structure_ok(closes, USE_MA_FILTERS)
+        vol_score, v_ratio = _volume_score(vols)
+        conf = _confidence_score(closes, ohlcv, USE_MA_FILTERS)
 
+        # first pass
         tmp_inp = CoreInputs(
             trend_strength=trend,
             structure_ok=struct_ok,
@@ -402,7 +461,6 @@ def generate_signal() -> Optional[Dict[str, Any]]:
         )
         tmp_dec = core.decide(tmp_inp)
         ai_score = float(tmp_dec["ai_score"])
-
         risk = _risk_state(vol_reg, ai_score)
 
         inp = CoreInputs(
@@ -417,18 +475,28 @@ def generate_signal() -> Optional[Dict[str, Any]]:
 
         if GEN_DEBUG:
             logger.info(
-                f"[GEN] CORE_DECISION | symbol={symbol} "
-                f"ai={decision['ai_score']:.3f} macro={decision['macro_gate']} strat={decision['active_strategy']} "
-                f"final={decision['final_trade_decision']} risk={risk} volReg={vol_reg} atr%={atrp:.2f} "
-                f"last={last:.6f} prev={prev:.6f} dropped_last_candle={dropped} outbox={outbox_path}"
+                f"[GEN] CORE_DECISION | symbol={symbol} ai={decision['ai_score']:.3f} macro={decision['macro_gate']} "
+                f"strat={decision['active_strategy']} final={decision['final_trade_decision']} risk={risk} "
+                f"volReg={vol_reg} atr%={atrp:.2f} last={last:.6f} prev={prev:.6f} "
+                f"dropped_last_candle={dropped} outbox={outbox_path}"
             )
+
+            # deep diag
+            mom1 = _momentum(closes, 1)
+            mom10 = _momentum(closes, 10)
+            slope = _slope_sma(closes)
+            ups3 = _ups_count(closes, 3)
+            s5 = _sma(closes, 5)
+            s10 = _sma(closes, 10)
+            v5 = sum(vols[-5:]) / 5.0 if len(vols) >= 5 else 0.0
+            v20 = sum(vols[-20:]) / 20.0 if len(vols) >= 20 else 0.0
+
             logger.info(
-                f"[GEN] DIAG | symbol={symbol} "
-                f"trend={trend:.3f} conf={conf:.3f} struct={struct_ok} vol_score={vol_score:.3f} "
-                f"struct_reason={struct_reason} "
-                f"mom1={trend_dbg.get('mom1',0.0):.6f} mom10={trend_dbg.get('mom10',0.0):.6f} slope={trend_dbg.get('slope',0.0):.6f} "
-                f"v5={vol_dbg.get('v5',0.0):.3f} v20={vol_dbg.get('v20',0.0):.3f} vRatio={vol_dbg.get('ratio',0.0):.3f} "
-                f"ups3={struct_dbg.get('ups3',0.0):.0f}"
+                f"[GEN] DIAG | symbol={symbol} trend={trend:.3f} conf={conf:.3f} struct={struct_ok} "
+                f"vol_score={vol_score:.3f} struct_reason={struct_reason} "
+                f"mom1={mom1:.6f} mom10={mom10:.6f} slope={slope:.6f} ups3={ups3} "
+                f"sma5={s5:.6f} sma10={s10:.6f} v5={v5:.3f} v20={v20:.3f} vRatio={v_ratio:.3f} "
+                f"use_ma={USE_MA_FILTERS}"
             )
 
         # Protective SELL if active OCO and risk is KILL
@@ -445,20 +513,32 @@ def generate_signal() -> Optional[Dict[str, Any]]:
                     "reason": "RISK_KILL_OVERRIDE",
                     "decision": decision,
                 },
-                "execution": {"symbol": symbol, "direction": "LONG", "entry": {"type": "MARKET"}},
+                "execution": {
+                    "symbol": symbol,
+                    "direction": "LONG",
+                    "entry": {"type": "MARKET"},
+                }
             }
             _emit(sig, outbox_path)
             return sig
 
-        # If active OCO → we do not open new TRADE
         if active_oco and BLOCK_SIGNALS_WHEN_ACTIVE_OCO:
             continue
 
-        # TRADE only if final decision says EXECUTE
         if decision["final_trade_decision"] != "EXECUTE":
             continue
 
-        # Extra live guards
+        # -----------------------------
+        # EXTRA LIVE GUARDS
+        # -----------------------------
+        if USE_MA_FILTERS:
+            ma20 = _sma(closes, 20)
+            ma_gap_abs = abs(_pct(last, ma20))
+            if ma_gap_abs < MA_GAP_PCT:
+                if GEN_DEBUG:
+                    logger.info(f"[GEN] BLOCKED_BY_MA_GAP | symbol={symbol} gap%={ma_gap_abs:.3f} < MA_GAP_PCT={MA_GAP_PCT:.3f}")
+                continue
+
         if conf < BUY_CONFIDENCE_MIN:
             if GEN_DEBUG:
                 logger.info(f"[GEN] BLOCKED_BY_CONF | symbol={symbol} conf={conf:.3f} < BUY_CONFIDENCE_MIN={BUY_CONFIDENCE_MIN:.3f}")
@@ -481,13 +561,17 @@ def generate_signal() -> Optional[Dict[str, Any]]:
             "ts_utc": _now_utc_iso(),
             "certified_signal": True,
             "final_verdict": "TRADE",
-            "meta": {"source": "DYZEN_EXCEL_LIVE_CORE", "symbol": symbol, "decision": decision},
+            "meta": {
+                "source": "DYZEN_EXCEL_LIVE_CORE",
+                "symbol": symbol,
+                "decision": decision,
+            },
             "execution": {
                 "symbol": symbol,
                 "direction": "LONG",
                 "entry": {"type": "MARKET"},
                 "quote_amount": BOT_QUOTE_PER_TRADE,
-            },
+            }
         }
 
         _emit(sig, outbox_path)
