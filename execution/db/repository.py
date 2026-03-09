@@ -173,6 +173,7 @@ def has_open_trade_for_symbol(symbol: str) -> bool:
     )
     return row is not None
 
+
 # -----------------------
 # trades (performance)
 # -----------------------
