@@ -160,6 +160,19 @@ def has_active_oco_for_symbol(symbol: str) -> bool:
     return row is not None
 
 
+def has_open_trade_for_symbol(symbol: str) -> bool:
+    row = _fetchone(
+        """
+        SELECT signal_id
+        FROM trades
+        WHERE UPPER(symbol) = UPPER(?)
+          AND closed_at IS NULL
+        LIMIT 1
+        """,
+        (str(symbol),),
+    )
+    return row is not None
+
 # -----------------------
 # trades (performance)
 # -----------------------
