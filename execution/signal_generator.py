@@ -9,7 +9,7 @@ from typing import Optional, Dict, Any, Tuple, List
 import ccxt
 
 from execution.signal_client import append_signal
-from execution.db.repository import has_active_oco_for_symbol
+from execution.db.repository import has_active_oco_for_symbol, has_open_trade_for_symbol
 from execution.excel_live_core import ExcelLiveCore, CoreInputs
 
 logger = logging.getLogger("gbm")
@@ -87,6 +87,15 @@ def _has_active_oco(symbol: str) -> bool:
     except Exception as e:
         # safe default: assume active OCO to prevent uncontrolled trading
         logger.warning(f"[GEN] ACTIVE_OCO_CHECK_FAIL | symbol={symbol} err={e} -> assume active_oco=True")
+        return True
+
+
+def _has_open_trade(symbol: str) -> bool:
+    try:
+        return has_open_trade_for_symbol(symbol)
+    except Exception as e:
+        # safe default: assume open trade to prevent duplicate live entries
+        logger.warning(f"[GEN] OPEN_TRADE_CHECK_FAIL | symbol={symbol} err={e} -> assume open_trade=True")
         return True
 
 
@@ -433,6 +442,7 @@ def generate_signal() -> Optional[Dict[str, Any]]:
 
     for symbol in SYMBOLS:
         active_oco = _has_active_oco(symbol)
+        open_trade = _has_open_trade(symbol)
 
         try:
             ohlcv = EXCHANGE.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=CANDLE_LIMIT)
@@ -545,7 +555,14 @@ def generate_signal() -> Optional[Dict[str, Any]]:
             _emit(sig, outbox_path)
             return sig
 
+        if open_trade:
+            if GEN_DEBUG:
+                logger.info(f"[GEN] BLOCKED_BY_OPEN_TRADE | symbol={symbol}")
+            continue
+
         if active_oco and BLOCK_SIGNALS_WHEN_ACTIVE_OCO:
+            if GEN_DEBUG:
+                logger.info(f"[GEN] BLOCKED_BY_ACTIVE_OCO | symbol={symbol}")
             continue
 
         if decision["final_trade_decision"] != "EXECUTE":
