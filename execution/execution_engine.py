@@ -16,6 +16,7 @@ from execution.db.repository import (
     signal_id_already_executed,
     mark_signal_id_executed,
     has_active_oco_for_symbol,
+    has_open_trade_for_symbol,
 
     # ✅ performance tracking
     open_trade,
@@ -496,16 +497,33 @@ class ExecutionEngine:
 
             # race-condition guard
             try:
+                if has_open_trade_for_symbol(str(symbol)):
+                    msg = f"EXEC_REJECT | OPEN_TRADE_RACE | id={signal_id} symbol={symbol}"
+                    logger.warning(msg)
+                    log_event("EXEC_REJECT_OPEN_TRADE_RACE", msg)
+                    mark_signal_id_executed(
+                        signal_id,
+                        signal_hash=signal_hash,
+                        action="REJECT_OPEN_TRADE_RACE",
+                        symbol=str(symbol),
+                    )
+                    return
+
                 if has_active_oco_for_symbol(str(symbol)):
                     msg = f"EXEC_REJECT | ACTIVE_OCO_RACE | id={signal_id} symbol={symbol}"
                     logger.warning(msg)
                     log_event("EXEC_REJECT_ACTIVE_OCO_RACE", msg)
-                    mark_signal_id_executed(signal_id, signal_hash=signal_hash, action="REJECT_ACTIVE_OCO_RACE", symbol=str(symbol))
+                    mark_signal_id_executed(
+                        signal_id,
+                        signal_hash=signal_hash,
+                        action="REJECT_ACTIVE_OCO_RACE",
+                        symbol=str(symbol),
+                    )
                     return
             except Exception as e:
-                msg = f"EXEC_BLOCKED | ACTIVE_OCO_CHECK_FAIL | id={signal_id} symbol={symbol} err={e}"
+                msg = f"EXEC_BLOCKED | TRADE_STATE_CHECK_FAIL | id={signal_id} symbol={symbol} err={e}"
                 logger.warning(msg)
-                log_event("EXEC_BLOCKED_ACTIVE_OCO_CHECK_FAIL", msg)
+                log_event("EXEC_BLOCKED_TRADE_STATE_CHECK_FAIL", msg)
                 return
 
             # MIN_NOTIONAL
