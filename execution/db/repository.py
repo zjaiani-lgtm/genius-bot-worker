@@ -1,13 +1,9 @@
-# execution/db/repository.py
 import sqlite3
 from typing import Any, Dict, List, Optional, Tuple
 
 from execution.db.db import get_connection
 
 
-# -----------------------
-# helpers
-# -----------------------
 def _fetchone(query: str, params: Tuple = ()) -> Optional[Tuple]:
     conn = get_connection()
     cur = conn.cursor()
@@ -52,7 +48,6 @@ def get_system_state():
 
 
 def update_system_state(status: Optional[str] = None, startup_sync_ok: Optional[int] = None, kill_switch: Optional[int] = None) -> None:
-    # build dynamic update
     fields = []
     params = []
 
@@ -75,7 +70,7 @@ def update_system_state(status: Optional[str] = None, startup_sync_ok: Optional[
 
 
 # -----------------------
-# executed signals (idempotency)
+# executed signals
 # -----------------------
 def signal_id_already_executed(signal_id: str) -> bool:
     row = _fetchone("SELECT signal_id FROM executed_signals WHERE signal_id = ?", (str(signal_id),))
@@ -160,6 +155,9 @@ def has_active_oco_for_symbol(symbol: str) -> bool:
     return row is not None
 
 
+# -----------------------
+# trades
+# -----------------------
 def has_open_trade_for_symbol(symbol: str) -> bool:
     row = _fetchone(
         """
@@ -174,9 +172,21 @@ def has_open_trade_for_symbol(symbol: str) -> bool:
     return row is not None
 
 
-# -----------------------
-# trades (performance)
-# -----------------------
+def get_open_trade_for_symbol(symbol: str):
+    return _fetchone(
+        """
+        SELECT signal_id, symbol, qty, quote_in, entry_price, opened_at,
+               exit_price, closed_at, outcome, pnl_quote, pnl_pct
+        FROM trades
+        WHERE UPPER(symbol) = UPPER(?)
+          AND closed_at IS NULL
+        ORDER BY opened_at DESC
+        LIMIT 1
+        """,
+        (str(symbol),),
+    )
+
+
 def open_trade(signal_id: str, symbol: str, qty: float, quote_in: float, entry_price: float) -> None:
     _execute(
         """
@@ -218,7 +228,6 @@ def close_trade(signal_id: str, exit_price: float, outcome: str, pnl_quote: floa
 
 
 def get_trade_stats() -> Dict[str, Any]:
-    # CLOSED
     row = _fetchone(
         """
         SELECT
@@ -228,11 +237,14 @@ def get_trade_stats() -> Dict[str, Any]:
             COALESCE(SUM(pnl_quote), 0) AS pnl_quote_sum,
             COALESCE(SUM(quote_in), 0) AS quote_in_sum,
             COALESCE(SUM(CASE WHEN pnl_quote > 0 THEN pnl_quote ELSE 0 END), 0) AS gross_profit,
-            COALESCE(ABS(SUM(CASE WHEN pnl_quote < 0 THEN pnl_quote ELSE 0 END)), 0) AS gross_loss
+            COALESCE(ABS(SUM(CASE WHEN pnl_quote < 0 THEN pnl_quote ELSE 0 END)), 0) AS gross_loss,
+            COALESCE(AVG(CASE WHEN pnl_quote > 0 THEN pnl_quote END), 0) AS avg_win,
+            COALESCE(AVG(CASE WHEN pnl_quote < 0 THEN pnl_quote END), 0) AS avg_loss,
+            COALESCE(AVG(pnl_quote), 0) AS expectancy_quote
         FROM trades
         WHERE closed_at IS NOT NULL
         """
-    ) or (0, 0, 0, 0.0, 0.0, 0.0, 0.0)
+    ) or (0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
     closed_trades = int(row[0] or 0)
     wins = int(row[1] or 0)
@@ -241,12 +253,14 @@ def get_trade_stats() -> Dict[str, Any]:
     quote_in_sum = float(row[4] or 0.0)
     gross_profit = float(row[5] or 0.0)
     gross_loss = float(row[6] or 0.0)
+    avg_win = float(row[7] or 0.0)
+    avg_loss = float(row[8] or 0.0)
+    expectancy_quote = float(row[9] or 0.0)
 
     winrate_pct = (wins / closed_trades * 100.0) if closed_trades else 0.0
     roi_pct = (pnl_quote_sum / quote_in_sum * 100.0) if quote_in_sum else 0.0
     profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (gross_profit if gross_profit > 0 else 0.0)
 
-    # OPEN
     row2 = _fetchone(
         """
         SELECT
@@ -269,6 +283,11 @@ def get_trade_stats() -> Dict[str, Any]:
         "pnl_quote_sum": pnl_quote_sum,
         "quote_in_sum": quote_in_sum,
         "profit_factor": profit_factor,
+        "gross_profit": gross_profit,
+        "gross_loss": gross_loss,
+        "avg_win": avg_win,
+        "avg_loss": avg_loss,
+        "expectancy_quote": expectancy_quote,
         "open_trades": open_trades,
         "open_quote_in_sum": open_quote_in_sum,
     }
