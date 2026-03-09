@@ -32,21 +32,26 @@ ESTIMATED_SLIPPAGE_PCT = float(os.getenv("ESTIMATED_SLIPPAGE_PCT", "0.15"))
 TP_PCT = float(os.getenv("TP_PCT", "1.3"))
 MIN_NET_PROFIT_PCT = float(os.getenv("MIN_NET_PROFIT_PCT", "0.60"))
 
-# ✅ NEW: ATR sanity factor (replaces hardcoded 0.75)
-# Example: TP_PCT=1.0 and factor=0.20 means require atr% >= 0.20 (plus MIN_MOVE_PCT check)
+# ATR sanity
 ATR_TO_TP_SANITY_FACTOR = float(os.getenv("ATR_TO_TP_SANITY_FACTOR", "0.20"))
 
-# Optional MA filters (FULL OFF switch)
+# Optional MA filters
 USE_MA_FILTERS = os.getenv("USE_MA_FILTERS", "true").strip().lower() == "true"
-MA_GAP_PCT = float(os.getenv("MA_GAP_PCT", "0.15"))  # used only if USE_MA_FILTERS=true
+MA_GAP_PCT = float(os.getenv("MA_GAP_PCT", "0.15"))
 
-# Extra confidence guard (on top of Excel)
-BUY_CONFIDENCE_MIN = float(os.getenv("BUY_CONFIDENCE_MIN", "0.70"))
+# Extra confidence guard (after Excel decision)
+BUY_CONFIDENCE_MIN = float(os.getenv("BUY_CONFIDENCE_MIN", "0.64"))
 
 BLOCK_SIGNALS_WHEN_ACTIVE_OCO = os.getenv("BLOCK_SIGNALS_WHEN_ACTIVE_OCO", "true").strip().lower() == "true"
 
 GEN_DEBUG = os.getenv("GEN_DEBUG", "true").strip().lower() == "true"
 GEN_LOG_EVERY_TICK = os.getenv("GEN_LOG_EVERY_TICK", "true").strip().lower() == "true"
+
+# Soft structure override (USED ONLY WHEN USE_MA_FILTERS=false)
+STRUCT_SOFT_OVERRIDE = os.getenv("STRUCT_SOFT_OVERRIDE", "true").strip().lower() == "true"
+STRUCT_SOFT_MIN_TREND = float(os.getenv("STRUCT_SOFT_MIN_TREND", "0.58"))
+STRUCT_SOFT_MIN_MA_GAP = float(os.getenv("STRUCT_SOFT_MIN_MA_GAP", "0.35"))
+STRUCT_SOFT_REQUIRE_LAST_UP = int(os.getenv("STRUCT_SOFT_REQUIRE_LAST_UP", "2"))
 
 # Excel model path
 EXCEL_MODEL_PATH = os.getenv("EXCEL_MODEL_PATH", "/var/data/DYZEN_CAPITAL_OS_AI_LIVE_CORE_READY.xlsx").strip()
@@ -54,6 +59,7 @@ if EXCEL_MODEL_PATH.lower().startswith("excel_model_path="):
     EXCEL_MODEL_PATH = EXCEL_MODEL_PATH.split("=", 1)[1].strip()
 
 _last_emit_ts: float = 0.0
+
 
 # -----------------------------
 # HELPERS
@@ -85,7 +91,6 @@ def _has_active_oco(symbol: str) -> bool:
     try:
         return has_active_oco_for_symbol(symbol)
     except Exception as e:
-        # safe default: assume active OCO to prevent uncontrolled trading
         logger.warning(f"[GEN] ACTIVE_OCO_CHECK_FAIL | symbol={symbol} err={e} -> assume active_oco=True")
         return True
 
@@ -94,7 +99,6 @@ def _has_open_trade(symbol: str) -> bool:
     try:
         return has_open_trade_for_symbol(symbol)
     except Exception as e:
-        # safe default: assume open trade to prevent duplicate live entries
         logger.warning(f"[GEN] OPEN_TRADE_CHECK_FAIL | symbol={symbol} err={e} -> assume open_trade=True")
         return True
 
@@ -177,15 +181,6 @@ def _vol_regime(atr_pct: float) -> str:
 
 
 def _edge_ok(atr_pct: float) -> Tuple[bool, str]:
-    """
-    Fee-aware edge gate.
-
-    Requirements:
-      1) atr% >= MIN_MOVE_PCT
-      2) TP_PCT must cover (fees + slippage) + MIN_NET_PROFIT_PCT
-      3) atr% should be at least TP_PCT * ATR_TO_TP_SANITY_FACTOR
-         (previously hardcoded to 0.75, now env-controlled)
-    """
     if atr_pct < MIN_MOVE_PCT:
         return False, f"ATR_TOO_LOW atr%={atr_pct:.2f} < MIN_MOVE_PCT={MIN_MOVE_PCT:.2f}"
 
@@ -236,7 +231,6 @@ def _tf_seconds(tf: str) -> int:
             return max(1, int(tf[:-1])) * 86400
     except Exception:
         pass
-    # fallback 15m
     return 900
 
 
@@ -246,7 +240,6 @@ def _drop_unclosed_candle(ohlcv: List[List[float]], timeframe: str) -> Tuple[Lis
     last_ts_ms = int(ohlcv[-1][0])
     now_ms = int(time.time() * 1000)
     tf_ms = _tf_seconds(timeframe) * 1000
-    # if last candle start is too recent, it's likely still forming
     if now_ms - last_ts_ms < tf_ms:
         return ohlcv[:-1], True
     return ohlcv, False
@@ -266,7 +259,7 @@ def _build_exchange() -> ccxt.Exchange:
             "enableRateLimit": True,
             "apiKey": api_key,
             "secret": api_secret,
-            "options": {"defaultType": market_type},  # "spot" / "swap"
+            "options": {"defaultType": market_type},
         })
 
     api_key = os.getenv("BINANCE_API_KEY", "").strip()
@@ -283,7 +276,7 @@ EXCHANGE = _build_exchange()
 
 
 # -----------------------------
-# FEATURE CALCS (NO-MA READY)
+# FEATURE CALCS
 # -----------------------------
 def _momentum(closes: List[float], n: int) -> float:
     if len(closes) < n + 1:
@@ -295,7 +288,6 @@ def _momentum(closes: List[float], n: int) -> float:
 
 
 def _slope_sma(closes: List[float]) -> float:
-    # normalized slope: SMA5 vs SMA10
     if len(closes) < 10:
         return 0.0
     s5 = _sma(closes, 5)
@@ -316,42 +308,30 @@ def _ups_count(closes: List[float], n: int) -> int:
 
 
 def _trend_strength(closes: List[float], use_ma: bool) -> float:
-    """
-    Returns 0..1
-    If USE_MA_FILTERS: include last vs MA20 separation
-    Else: rely on slope + momentum
-    """
     if len(closes) < 20:
         return 0.0
 
     last = closes[-1]
     prev = closes[-2]
-    mom1 = _momentum(closes, 1)        # ~0.001 == 0.1%
-    slope = _slope_sma(closes)         # ~0.001 == +0.1%
+    mom1 = _momentum(closes, 1)
+    slope = _slope_sma(closes)
     ups3 = _ups_count(closes, 3)
 
     base = 0.0
     base += 0.35 * (1.0 if last > prev else 0.0)
-    base += 0.25 * max(0.0, min(1.0, (mom1 / 0.003)))     # 0.3% -> 1.0
-    base += 0.20 * max(0.0, min(1.0, (slope / 0.003)))    # 0.3% -> 1.0
+    base += 0.25 * max(0.0, min(1.0, (mom1 / 0.003)))
+    base += 0.20 * max(0.0, min(1.0, (slope / 0.003)))
     base += 0.20 * (ups3 / 3.0)
 
     if use_ma:
         ma20 = _sma(closes, 20)
-        gap_pct = _pct(last, ma20)  # %
-        base += 0.15 * max(0.0, min(1.0, gap_pct / 0.6))   # 0.6% above MA -> +0.15
+        gap_pct = _pct(last, ma20)
+        base += 0.15 * max(0.0, min(1.0, gap_pct / 0.6))
 
     return max(0.0, min(1.0, base))
 
 
-def _structure_ok(closes: List[float], use_ma: bool) -> Tuple[bool, str]:
-    """
-    If MA disabled, require:
-      - SMA5 > SMA10
-      - at least 2 up candles in last 3
-      - mom10 not strongly negative
-      - last > prev
-    """
+def _structure_ok(closes: List[float], use_ma: bool, trend_strength: float) -> Tuple[bool, str]:
     if len(closes) < 20:
         return False, "len<20"
 
@@ -365,7 +345,7 @@ def _structure_ok(closes: List[float], use_ma: bool) -> Tuple[bool, str]:
     c_last_prev = last > prev
     c_sma = s5 > s10
     c_ups = ups3 >= 2
-    c_mom10 = mom10 > -0.002  # not worse than -0.2% over 10 candles
+    c_mom10 = mom10 > -0.002
 
     if use_ma:
         ma20 = _sma(closes, 20)
@@ -377,33 +357,54 @@ def _structure_ok(closes: List[float], use_ma: bool) -> Tuple[bool, str]:
         )
         return ok, reason
 
-    ok = c_last_prev and c_sma and c_ups and c_mom10
-    reason = f"last>prev={int(c_last_prev)} sma5>sma10={int(c_sma)} ups3>=2={int(c_ups)} mom10_ok={int(c_mom10)}"
-    return ok, reason
+    # strict no-MA mode
+    strict_ok = c_last_prev and c_sma and c_ups and c_mom10
+    if strict_ok:
+        reason = (
+            f"strict last>prev={int(c_last_prev)} sma5>sma10={int(c_sma)} "
+            f"ups3>=2={int(c_ups)} mom10_ok={int(c_mom10)}"
+        )
+        return True, reason
+
+    # soft no-MA override
+    if STRUCT_SOFT_OVERRIDE:
+        sma_gap_pct = _pct(s5, s10)  # can be slightly negative
+        c_soft_trend = trend_strength >= STRUCT_SOFT_MIN_TREND
+        c_soft_last = c_last_prev if STRUCT_SOFT_REQUIRE_LAST_UP > 0 else True
+        c_soft_ups = ups3 >= STRUCT_SOFT_REQUIRE_LAST_UP
+        c_soft_sma_gap = sma_gap_pct >= (-1.0 * STRUCT_SOFT_MIN_MA_GAP)
+        c_soft_mom10 = mom10 > -0.004
+
+        soft_ok = c_soft_trend and c_soft_last and c_soft_ups and c_soft_sma_gap and c_soft_mom10
+        reason = (
+            f"soft strict=0 last>prev={int(c_last_prev)} sma5>sma10={int(c_sma)} "
+            f"ups3={ups3} mom10={mom10:.6f} trend={trend_strength:.3f} sma_gap%={sma_gap_pct:.3f} "
+            f"soft_trend_ok={int(c_soft_trend)} soft_last_ok={int(c_soft_last)} "
+            f"soft_ups_ok={int(c_soft_ups)} soft_sma_gap_ok={int(c_soft_sma_gap)} "
+            f"soft_mom10_ok={int(c_soft_mom10)}"
+        )
+        return soft_ok, reason
+
+    reason = (
+        f"strict last>prev={int(c_last_prev)} sma5>sma10={int(c_sma)} "
+        f"ups3>=2={int(c_ups)} mom10_ok={int(c_mom10)}"
+    )
+    return False, reason
 
 
 def _volume_score(vols: List[float]) -> Tuple[float, float]:
-    """
-    Return (vol_score 0..1, vRatio)
-    score ~= vRatio clamped 0..1 (so 0.80 stays 0.80 and can pass vol_th=0.46)
-    """
     if len(vols) < 20:
         return 0.0, 0.0
     v_last = vols[-1]
     v_avg = sum(vols[-20:]) / 20.0
     if v_avg <= 0:
         return 0.0, 0.0
-    v_ratio = v_last / v_avg  # 1.0 normal
+    v_ratio = v_last / v_avg
     score = max(0.0, min(1.0, v_ratio))
     return score, v_ratio
 
 
 def _confidence_score(closes: List[float], ohlcv: List[List[float]], use_ma: bool) -> float:
-    """
-    Returns 0..1
-    If MA disabled: confidence mainly from last>prev + slope + non-extreme ATR
-    If MA enabled: include last>ma20 condition too
-    """
     if len(closes) < 20 or len(ohlcv) < 20:
         return 0.0
 
@@ -414,7 +415,7 @@ def _confidence_score(closes: List[float], ohlcv: List[List[float]], use_ma: boo
 
     cond_last_prev = 1.0 if last > prev else 0.0
     cond_atr = 1.0 if atrp < 2.0 else 0.0
-    cond_slope = max(0.0, min(1.0, slope / 0.003))  # 0.3% -> 1.0
+    cond_slope = max(0.0, min(1.0, slope / 0.003))
 
     if use_ma:
         ma20 = _sma(closes, 20)
@@ -470,11 +471,10 @@ def generate_signal() -> Optional[Dict[str, Any]]:
         vol_reg = _vol_regime(atrp)
 
         trend = _trend_strength(closes, USE_MA_FILTERS)
-        struct_ok, struct_reason = _structure_ok(closes, USE_MA_FILTERS)
+        struct_ok, struct_reason = _structure_ok(closes, USE_MA_FILTERS, trend)
         vol_score, v_ratio = _volume_score(vols)
         conf = _confidence_score(closes, ohlcv, USE_MA_FILTERS)
 
-        # first pass
         tmp_inp = CoreInputs(
             trend_strength=trend,
             structure_ok=struct_ok,
@@ -511,10 +511,10 @@ def generate_signal() -> Optional[Dict[str, Any]]:
             ups3 = _ups_count(closes, 3)
             v5 = sum(vols[-5:]) / 5.0 if len(vols) >= 5 else 0.0
             v20 = sum(vols[-20:]) / 20.0 if len(vols) >= 20 else 0.0
+            s5 = _sma(closes, 5)
+            s10 = _sma(closes, 10)
 
             if USE_MA_FILTERS:
-                s5 = _sma(closes, 5)
-                s10 = _sma(closes, 10)
                 ma20 = _sma(closes, 20)
                 ma_gap_abs = abs(_pct(last, ma20))
                 logger.info(
@@ -525,10 +525,12 @@ def generate_signal() -> Optional[Dict[str, Any]]:
                     f"v5={v5:.3f} v20={v20:.3f} vRatio={v_ratio:.3f} use_ma={USE_MA_FILTERS}"
                 )
             else:
+                sma_gap_pct = _pct(s5, s10) if s10 else 0.0
                 logger.info(
                     f"[GEN] DIAG | symbol={symbol} trend={trend:.3f} conf={conf:.3f} struct={struct_ok} "
                     f"vol_score={vol_score:.3f} struct_reason={struct_reason} "
                     f"mom1={mom1:.6f} mom10={mom10:.6f} slope={slope:.6f} ups3={ups3} "
+                    f"sma5={s5:.6f} sma10={s10:.6f} sma_gap%={sma_gap_pct:.3f} "
                     f"v5={v5:.3f} v20={v20:.3f} vRatio={v_ratio:.3f} use_ma={USE_MA_FILTERS}"
                 )
 
