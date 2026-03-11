@@ -2,7 +2,11 @@ import os
 import time
 import logging
 from typing import Any, Dict, Optional, Tuple
-
+from execution.db.repository import get_trade_stats
+from execution.telegram_notifier import (
+    notify_signal_created,
+    notify_trade_closed,
+)
 import ccxt
 
 from execution.db.repository import (
